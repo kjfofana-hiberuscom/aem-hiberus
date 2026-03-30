@@ -1,0 +1,60 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "MCP: Build",
+      "icon": { "id": "package", "color": "terminal.ansiBlue" },
+      "type": "shell",
+      "command": "npm run build",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "MCP: Launch Inspector",
+      "icon": { "id": "search", "color": "terminal.ansiYellow" },
+      "type": "shell",
+      "command": "npx @modelcontextprotocol/inspector node build/index.js",
+      "dependsOn": "MCP: Build",
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "MCP: Build + Inspector",
+      "icon": { "id": "rocket", "color": "terminal.ansiGreen" },
+      "dependsOn": ["MCP: Build", "MCP: Launch Inspector"],
+      "dependsOrder": "sequence",
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "MCP: Run Server (sin Inspector)",
+      "icon": { "id": "play", "color": "terminal.ansiCyan" },
+      "type": "shell",
+      "command": "node build/index.js",
+      "dependsOn": "MCP: Build",
+      "dependsOrder": "sequence",
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
