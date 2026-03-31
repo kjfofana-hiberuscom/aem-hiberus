@@ -77,3 +77,16 @@ export interface AemExperienceFragment {
   lastModified: string;
   status: string;
 }
+
+export interface AemAsset {
+  path: string;
+  name: string;
+  mimeType?: string;
+  title?: string;
+}
+
+export interface AemAssetFolder {
+  path: string;
+  name: string;
+  depth: number;
+}

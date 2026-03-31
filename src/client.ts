@@ -101,6 +101,46 @@ export class AemClient {
     });
   }
 
+  /** POST raw binary body (used by asset upload via /api/assets/).
+   *  Uses same Basic Auth as all other methods. */
+  async postBinary(
+    path: string,
+    data: Buffer | Uint8Array,
+    contentType: string
+  ): Promise<any> {
+    const url = path.startsWith("http") ? path : `${this.baseUrl}${path}`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: this.authHeader,
+        "Content-Type": contentType,
+        Accept: "application/json",
+      },
+      body: data.buffer.slice(
+        data.byteOffset,
+        data.byteOffset + data.byteLength
+      ) as ArrayBuffer,
+      redirect: "follow",
+    });
+
+    if (response.status === 204) return {};
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      const e: any = new Error(
+        `AEM POST ${path} → ${response.status}: ${text.slice(0, 300)}`
+      );
+      e.status = response.status;
+      throw e;
+    }
+    const text = await response.text();
+    if (!text || text.trim() === "") return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+
   /** POST and return raw Response (needed for Location header on workflow creation) */
   async postRaw(path: string, body: URLSearchParams): Promise<Response> {
     const url = `${this.baseUrl}${path}`;

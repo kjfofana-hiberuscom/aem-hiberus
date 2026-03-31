@@ -29,6 +29,7 @@ import { registerPublishingTools } from "./tools/publishing.js";
 import { registerWorkflowTools } from "./tools/workflows.js";
 import { registerContentFragmentTools } from "./tools/content-fragments.js";
 import { registerExperienceFragmentTools } from "./tools/experience-fragments.js";
+import { registerAssetTools } from "./tools/assets.js";
 
 // ---------------------------------------------------------------------------
 // Server factory
@@ -52,6 +53,7 @@ function buildMcpServer(config: ReturnType<typeof loadConfig>): McpServer {
   registerWorkflowTools(server, client, config);
   registerContentFragmentTools(server, client, config);
   registerExperienceFragmentTools(server, client, config);
+  registerAssetTools(server, client, config);
 
   return server;
 }
