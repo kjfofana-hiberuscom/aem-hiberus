@@ -6,6 +6,7 @@
   "description": "Generic MCP server skeleton — TypeScript template for any integration",
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test build/test/**/*.test.js",
     "start": "node build/index.js",
     "start:http": "MCP_TRANSPORT=http node build/index.js",
     "dev": "tsc --watch"

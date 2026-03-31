@@ -88,6 +88,26 @@ export class AemClient {
     return this.request("GET", fullPath);
   }
 
+  /** GET a JCR JSON endpoint with numeric depth or infinity. */
+  async getJson(path: string, depthOrInfinity: number | "infinity" = 1): Promise<any> {
+    const suffix =
+      depthOrInfinity === "infinity" ? ".infinity.json" : `.${depthOrInfinity}.json`;
+    return this.get(`${path}${suffix}`);
+  }
+
+  /** Check whether a JCR path exists. */
+  async exists(path: string): Promise<boolean> {
+    try {
+      await this.get(`${path}.json`);
+      return true;
+    } catch (error: any) {
+      if (error?.status === 404) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
   /** POST with URLSearchParams (Sling form post) */
   async post(path: string, body: URLSearchParams): Promise<any> {
     return this.request("POST", path, body, { Accept: "application/json" });
@@ -181,11 +201,16 @@ export class AemClient {
   }
 
   /** Sling import with JSON content */
-  async slingImport(path: string, content: object): Promise<any> {
+  async slingImport(
+    path: string,
+    content: object,
+    options: { replace?: boolean; replaceProperties?: boolean } = {}
+  ): Promise<any> {
     const fd = new URLSearchParams();
     fd.append(":operation", "import");
     fd.append(":contentType", "json");
-    fd.append(":replace", "true");
+    fd.append(":replace", String(options.replace ?? true));
+    fd.append(":replaceProperties", String(options.replaceProperties ?? true));
     fd.append(":content", JSON.stringify(content));
     return this.post(path, fd);
   }

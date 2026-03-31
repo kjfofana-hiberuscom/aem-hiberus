@@ -2,6 +2,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AemClient } from "../client.js";
 import type { AemConfig } from "../config.js";
+import {
+  buildExperienceFragmentTree,
+  cloneJcrSubtree,
+  extractExperienceFragmentVariationNames,
+} from "../jcr-helpers.js";
+import type {
+  AemExperienceFragmentCloneResult,
+  AemExperienceFragmentTreeNode,
+  AemExperienceFragmentTreeStats,
+} from "../types.js";
 
 function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -66,6 +76,49 @@ export function registerExperienceFragmentTools(
   );
 
   // -------------------------------------------------------------------------
+  // cloneExperienceFragment
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "cloneExperienceFragment",
+    {
+      description: "Clone an Experience Fragment subtree to a new path, preserving its JCR structure.",
+      inputSchema: {
+        sourceXfPath: z.string().describe("Source Experience Fragment path to clone"),
+        targetXfPath: z.string().describe("Target Experience Fragment path to create"),
+        overwrite: z.boolean().default(false).describe("If true, delete the target subtree before cloning"),
+      },
+    },
+    async ({ sourceXfPath, targetXfPath, overwrite }) => {
+      if (config.readOnly) return readOnlyErr();
+      try {
+        const cloneResult = await cloneJcrSubtree(client, {
+          sourcePath: sourceXfPath,
+          targetPath: targetXfPath,
+          overwrite,
+        });
+
+        const variationNames = extractExperienceFragmentVariationNames(cloneResult.sanitizedContent);
+        const xfContent = cloneResult.sanitizedContent["jcr:content"] as Record<string, unknown> | undefined;
+        const result: AemExperienceFragmentCloneResult = {
+          sourcePath: cloneResult.sourcePath,
+          targetPath: cloneResult.targetPath,
+          overwrite: cloneResult.overwrite,
+          rootTitle:
+            typeof xfContent?.["jcr:title"] === "string"
+              ? xfContent["jcr:title"]
+              : cloneResult.verification.title,
+          variationNames,
+          verification: cloneResult.verification,
+        };
+
+        return ok(result);
+      } catch (e: any) {
+        return err(`cloneExperienceFragment failed: ${e.message}`);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
   // listExperienceFragments
   // -------------------------------------------------------------------------
   server.registerTool(
@@ -109,6 +162,67 @@ export function registerExperienceFragmentTools(
         });
       } catch (e: any) {
         return err(`listExperienceFragments failed: ${e.message}`);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // getExperienceFragmentTree
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "getExperienceFragmentTree",
+    {
+      description: "Get a hierarchical tree view of Experience Fragments and their variations under a base path.",
+      inputSchema: {
+        basePath: z
+          .string()
+          .default("/content/experience-fragments")
+          .describe("Root path to build the Experience Fragment tree from"),
+      },
+    },
+    async ({ basePath }) => {
+      try {
+        const fragmentQuery = await client.get("/bin/querybuilder.json", {
+          path: basePath,
+          type: "cq:Page",
+          property: "jcr:content/sling:resourceType",
+          "property.value": "cq/experience-fragments/components/experiencefragment",
+          "p.limit": -1,
+          "p.hits": "selective",
+          "p.properties": "jcr:path jcr:content/jcr:title",
+          orderby: "jcr:path",
+        });
+
+        const variationQuery = await client.get("/bin/querybuilder.json", {
+          path: basePath,
+          type: "cq:Page",
+          property: "jcr:content/cq:xfVariantType",
+          "property.operation": "exists",
+          "p.limit": -1,
+          "p.hits": "selective",
+          "p.properties": "jcr:path jcr:content/jcr:title",
+          orderby: "jcr:path",
+        });
+
+        const fragmentNodes = (fragmentQuery.hits || []).map((hit: Record<string, unknown>) => ({
+          path: String(hit["jcr:path"] ?? hit["path"] ?? ""),
+          title: typeof hit["jcr:content/jcr:title"] === "string" ? hit["jcr:content/jcr:title"] : undefined,
+        }));
+
+        const variationNodes = (variationQuery.hits || []).map((hit: Record<string, unknown>) => ({
+          path: String(hit["jcr:path"] ?? hit["path"] ?? ""),
+          title: typeof hit["jcr:content/jcr:title"] === "string" ? hit["jcr:content/jcr:title"] : undefined,
+        }));
+
+        const treeResult = buildExperienceFragmentTree(basePath, fragmentNodes, variationNodes);
+        return ok({
+          basePath,
+          tree: treeResult.tree,
+          nodes: treeResult.root.children as AemExperienceFragmentTreeNode[],
+          stats: treeResult.stats as AemExperienceFragmentTreeStats,
+        });
+      } catch (e: any) {
+        return err(`getExperienceFragmentTree failed: ${e.message}`);
       }
     }
   );

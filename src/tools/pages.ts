@@ -2,6 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AemClient } from "../client.js";
 import type { AemConfig } from "../config.js";
+import { cloneJcrSubtree } from "../jcr-helpers.js";
+import type { AemPageCloneResult } from "../types.js";
 
 function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -212,6 +214,48 @@ export function registerPageTools(
         });
       } catch (e: any) {
         return err(`createPage failed: ${e.message}`);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // clonePage
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "clonePage",
+    {
+      description: "Clone an AEM page subtree to a new path, preserving its JCR structure.",
+      inputSchema: {
+        sourcePagePath: z.string().describe("Source page path to clone"),
+        targetPagePath: z.string().describe("Target page path to create"),
+        overwrite: z.boolean().default(false).describe("If true, delete the target subtree before cloning"),
+      },
+    },
+    async ({ sourcePagePath, targetPagePath, overwrite }) => {
+      if (config.readOnly) return readOnlyErr();
+      try {
+        const cloneResult = await cloneJcrSubtree(client, {
+          sourcePath: sourcePagePath,
+          targetPath: targetPagePath,
+          overwrite,
+        });
+
+        const pageContent = cloneResult.sanitizedContent["jcr:content"] as Record<string, unknown> | undefined;
+        const result: AemPageCloneResult = {
+          sourcePath: cloneResult.sourcePath,
+          targetPath: cloneResult.targetPath,
+          overwrite: cloneResult.overwrite,
+          pageTitle:
+            typeof pageContent?.["jcr:title"] === "string"
+              ? pageContent["jcr:title"]
+              : cloneResult.verification.title,
+          template: typeof pageContent?.["cq:template"] === "string" ? pageContent["cq:template"] : undefined,
+          verification: cloneResult.verification,
+        };
+
+        return ok(result);
+      } catch (e: any) {
+        return err(`clonePage failed: ${e.message}`);
       }
     }
   );

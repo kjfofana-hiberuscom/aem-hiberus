@@ -90,3 +90,43 @@ export interface AemAssetFolder {
   name: string;
   depth: number;
 }
+
+export interface AemCloneVerification {
+  exists: boolean;
+  primaryType?: string;
+  resourceType?: string;
+  title?: string;
+  childNodeCount: number;
+}
+
+export interface AemExperienceFragmentCloneResult {
+  sourcePath: string;
+  targetPath: string;
+  overwrite: boolean;
+  rootTitle?: string;
+  variationNames: string[];
+  verification: AemCloneVerification;
+}
+
+export interface AemPageCloneResult {
+  sourcePath: string;
+  targetPath: string;
+  overwrite: boolean;
+  pageTitle?: string;
+  template?: string;
+  verification: AemCloneVerification;
+}
+
+export interface AemExperienceFragmentTreeNode {
+  name: string;
+  path: string;
+  nodeType: "folder" | "experience-fragment" | "variation";
+  title?: string;
+  children: AemExperienceFragmentTreeNode[];
+}
+
+export interface AemExperienceFragmentTreeStats {
+  fragmentCount: number;
+  variationCount: number;
+  totalNodeCount: number;
+}
