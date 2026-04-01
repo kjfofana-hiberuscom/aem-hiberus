@@ -99,6 +99,46 @@ export interface AemCloneVerification {
   childNodeCount: number;
 }
 
+export interface AemExperienceFragmentDetectedComponent {
+  path: string;
+  type: string;
+  language?: string;
+  textKeys: string[];
+  urlKeys: string[];
+  contentPreview?: string;
+  contentLength?: number;
+}
+
+export interface AemExperienceFragmentContentSummary {
+  variationCount: number;
+  componentCount: number;
+  resourceTypes: Array<{ resourceType: string; count: number }>;
+  textPropertyCount: number;
+  urlPropertyCount: number;
+}
+
+export interface AemExperienceFragmentAnalysis {
+  isEmpty: boolean;
+  language?: string;
+  detectedLanguages: string[];
+  translationRequired: boolean;
+  estimatedTranslationKeys: number;
+  requiresManualReview: boolean;
+  manualReviewReasons: string[];
+  components: AemExperienceFragmentDetectedComponent[];
+  contentSummary: AemExperienceFragmentContentSummary;
+}
+
+export interface AemExperienceFragmentCloneAnalysis {
+  hasUntranslatedText: boolean;
+  adaptedUrlCount: number;
+  requiresManualReview: boolean;
+  detectedLanguages: string[];
+  estimatedTranslationKeys: number;
+  manualReviewReasons: string[];
+  contentSummary: AemExperienceFragmentContentSummary;
+}
+
 export interface AemExperienceFragmentCloneResult {
   sourcePath: string;
   targetPath: string;
@@ -106,6 +146,7 @@ export interface AemExperienceFragmentCloneResult {
   rootTitle?: string;
   variationNames: string[];
   verification: AemCloneVerification;
+  contentMetadata?: AemExperienceFragmentCloneAnalysis;
 }
 
 export interface AemPageCloneResult {
@@ -122,6 +163,12 @@ export interface AemExperienceFragmentTreeNode {
   path: string;
   nodeType: "folder" | "experience-fragment" | "variation";
   title?: string;
+  language?: string;
+  lastModified?: string;
+  status?: string;
+  isEmpty?: boolean;
+  category?: string;
+  contentSummary?: AemExperienceFragmentContentSummary;
   children: AemExperienceFragmentTreeNode[];
 }
 
@@ -129,4 +176,52 @@ export interface AemExperienceFragmentTreeStats {
   fragmentCount: number;
   variationCount: number;
   totalNodeCount: number;
+}
+
+export interface AemExperienceFragmentStructureResult {
+  xfBasePath: string;
+  languageCode: string;
+  xfTypes: string[];
+  createdPaths: string[];
+  ensuredPaths: string[];
+  ready: boolean;
+}
+
+export interface AemExperienceFragmentAdaptationResult {
+  xfPath: string;
+  sourceLanguage: string;
+  targetLanguage: string;
+  adaptedNodes: number;
+  adaptedUrls: number;
+  requiresManualTranslation: string[];
+  requiresManualReview: boolean;
+  log: string[];
+}
+
+export interface AemExperienceFragmentCompareDifference {
+  node: string;
+  property: string;
+  source?: unknown;
+  target?: unknown;
+  status: "matching" | "adapted" | "missing" | "manual-review";
+}
+
+export interface AemExperienceFragmentCompareResult {
+  sourcePath: string;
+  targetPath: string;
+  matchPercent: number;
+  ready: boolean;
+  inspectedLeafCount: number;
+  differences: AemExperienceFragmentCompareDifference[];
+}
+
+export interface AemExperienceFragmentLanguageEntry {
+  name: string;
+  path: string;
+  title?: string;
+  isEmpty?: boolean;
+  variations?: string[];
+  lastModified?: string;
+  status?: string;
+  contentSummary?: AemExperienceFragmentContentSummary;
 }

@@ -224,7 +224,7 @@ export function registerPageTools(
   server.registerTool(
     "clonePage",
     {
-      description: "Clone an AEM page subtree to a new path, preserving its JCR structure.",
+      description: "Clone an AEM page subtree to a new path, preserving its JCR structure. Experimental and not part of the XF-first new-language workflow.",
       inputSchema: {
         sourcePagePath: z.string().describe("Source page path to clone"),
         targetPagePath: z.string().describe("Target page path to create"),

@@ -3,12 +3,25 @@ import { z } from "zod";
 import type { AemClient } from "../client.js";
 import type { AemConfig } from "../config.js";
 import {
+  adaptExperienceFragmentData,
   buildExperienceFragmentTree,
+  buildPostCloneAnalysis,
   cloneJcrSubtree,
+  compareExperienceFragmentData,
+  detectExperienceFragmentCategory,
+  ensureFolderPath,
+  inspectExperienceFragmentData,
+  normalizeJcrPath,
   extractExperienceFragmentVariationNames,
+  getParentPath,
+  sanitizeJcrSubtree,
 } from "../jcr-helpers.js";
 import type {
+  AemExperienceFragmentAdaptationResult,
   AemExperienceFragmentCloneResult,
+  AemExperienceFragmentCompareResult,
+  AemExperienceFragmentLanguageEntry,
+  AemExperienceFragmentStructureResult,
   AemExperienceFragmentTreeNode,
   AemExperienceFragmentTreeStats,
 } from "../types.js";
@@ -21,6 +34,69 @@ function err(msg: string) {
 }
 function readOnlyErr() {
   return err("Operation blocked: AEM_READ_ONLY=true");
+}
+
+const XF_TYPE_SCHEMA = z.enum(["site", "modals"]);
+
+function deriveExperienceFragmentBasePath(path: string): string {
+  const segments = normalizeJcrPath(path).split("/").filter(Boolean);
+  if (segments[0] === "content" && segments[1] === "experience-fragments" && segments[2]) {
+    return `/${segments.slice(0, 3).join("/")}`;
+  }
+  return "/content/experience-fragments";
+}
+
+function toPublishedStatus(rawStatus: string | undefined): string {
+  return rawStatus?.toLowerCase() === "activate" ? "published" : "draft";
+}
+
+function buildLanguageEntry(
+  path: string,
+  title: string | undefined,
+  includeMetadata: boolean,
+  inspection: ReturnType<typeof inspectExperienceFragmentData>
+): AemExperienceFragmentLanguageEntry {
+  return {
+    name: path.split("/").pop() ?? path,
+    path,
+    title,
+    isEmpty: includeMetadata ? inspection.analysis.isEmpty : undefined,
+    variations: includeMetadata ? inspection.variationNames : undefined,
+    lastModified: includeMetadata ? inspection.lastModified : undefined,
+    status: includeMetadata ? inspection.status : undefined,
+    contentSummary: includeMetadata ? inspection.analysis.contentSummary : undefined,
+  };
+}
+
+async function queryExperienceFragments(
+  client: AemClient,
+  basePath: string
+): Promise<Array<{ path: string; title?: string; lastModified?: string; replicationAction?: string }>> {
+  const result = await client.get("/bin/querybuilder.json", {
+    path: basePath,
+    type: "cq:Page",
+    property: "jcr:content/sling:resourceType",
+    "property.value": "cq/experience-fragments/components/experiencefragment",
+    "p.limit": -1,
+    "p.hits": "selective",
+    "p.properties": "jcr:path jcr:content/jcr:title jcr:content/cq:lastModified jcr:content/jcr:lastModified jcr:content/cq:lastReplicationAction",
+    orderby: "jcr:path",
+  });
+
+  return (result.hits || []).map((hit: Record<string, unknown>) => ({
+    path: String(hit["jcr:path"] ?? hit["path"] ?? ""),
+    title: typeof hit["jcr:content/jcr:title"] === "string" ? hit["jcr:content/jcr:title"] : undefined,
+    lastModified:
+      typeof hit["jcr:content/cq:lastModified"] === "string"
+        ? hit["jcr:content/cq:lastModified"]
+        : typeof hit["jcr:content/jcr:lastModified"] === "string"
+          ? hit["jcr:content/jcr:lastModified"]
+          : undefined,
+    replicationAction:
+      typeof hit["jcr:content/cq:lastReplicationAction"] === "string"
+        ? hit["jcr:content/cq:lastReplicationAction"]
+        : undefined,
+  }));
 }
 
 export function registerExperienceFragmentTools(
@@ -45,9 +121,10 @@ export function registerExperienceFragmentTools(
         const jcrContent = pageData["jcr:content"] || {};
 
         const variations: unknown[] = [];
-        for (const [childName, childData] of Object.entries(pageData as Record<string, any>)) {
-          if (childName.startsWith("jcr:") || childName.startsWith("rep:") || typeof childData !== "object") continue;
-          const childJcr = childData["jcr:content"];
+        for (const [childName, childData] of Object.entries(pageData as Record<string, unknown>)) {
+          if (childName.startsWith("jcr:") || childName.startsWith("rep:") || typeof childData !== "object" || childData === null) continue;
+          const childRecord = childData as Record<string, unknown>;
+          const childJcr = childRecord["jcr:content"] as Record<string, unknown> | undefined;
           if (!childJcr) continue;
           const variantType = childJcr["cq:xfVariantType"];
           if (!variantType) continue;
@@ -76,21 +153,163 @@ export function registerExperienceFragmentTools(
   );
 
   // -------------------------------------------------------------------------
+  // createExperienceFragmentStructure
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "createExperienceFragmentStructure",
+    {
+      description: "Create missing language-level Experience Fragment folders such as /<lang>/site and /<lang>/modals.",
+      inputSchema: {
+        xfBasePath: z.string().describe("Base XF portal path, e.g. /content/experience-fragments/caixabank-italia"),
+        languageCode: z.string().describe("Language code to create, e.g. it"),
+        xfTypes: z.array(XF_TYPE_SCHEMA).default(["site", "modals"]).describe("Folder groups to create under the language root"),
+      },
+    },
+    async ({ xfBasePath, languageCode, xfTypes }) => {
+      if (config.readOnly) return readOnlyErr();
+      try {
+        const basePath = normalizeJcrPath(xfBasePath);
+        const normalizedLanguage = languageCode.toLowerCase();
+        const languageRootPath = `${basePath}/${normalizedLanguage}`;
+        const createdPaths = await ensureFolderPath(client, {
+          path: languageRootPath,
+          rootPath: basePath,
+        });
+
+        const ensuredPaths = [languageRootPath];
+        for (const xfType of xfTypes) {
+          const ensuredPath = `${languageRootPath}/${xfType}`;
+          ensuredPaths.push(ensuredPath);
+          createdPaths.push(
+            ...await ensureFolderPath(client, {
+              path: ensuredPath,
+              rootPath: basePath,
+            })
+          );
+        }
+
+        const result: AemExperienceFragmentStructureResult = {
+          xfBasePath: basePath,
+          languageCode: normalizedLanguage,
+          xfTypes,
+          createdPaths: [...new Set(createdPaths)],
+          ensuredPaths,
+          ready: true,
+        };
+
+        return ok(result);
+      } catch (e: any) {
+        return err(`createExperienceFragmentStructure failed: ${e.message}`);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // detectXFContent
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "detectXFContent",
+    {
+      description: "Inspect an Experience Fragment and summarize authored components, language, emptiness, and manual translation needs.",
+      inputSchema: {
+        xfPath: z.string().describe("Experience Fragment path to inspect"),
+      },
+    },
+    async ({ xfPath }) => {
+      try {
+        const basePath = deriveExperienceFragmentBasePath(xfPath);
+        const xfData = await client.getJson(xfPath, "infinity");
+        const inspection = inspectExperienceFragmentData(xfPath, xfData, basePath);
+        return ok({
+          xfPath: normalizeJcrPath(xfPath),
+          title: inspection.title,
+          lastModified: inspection.lastModified,
+          status: inspection.status,
+          category: inspection.category,
+          variationNames: inspection.variationNames,
+          ...inspection.analysis,
+        });
+      } catch (e: any) {
+        return err(`detectXFContent failed: ${e.message}`);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // adaptXFContent
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "adaptXFContent",
+    {
+      description: "Adapt whitelisted URL/path properties inside an Experience Fragment using explicit rewrite rules.",
+      inputSchema: {
+        xfPath: z.string().describe("Experience Fragment path to adapt"),
+        sourceLanguage: z.string().describe("Source language code, e.g. pl"),
+        targetLanguage: z.string().describe("Target language code, e.g. it"),
+        internalUrlPatternFrom: z.string().optional().describe("Optional explicit string to replace in internal URLs"),
+        internalUrlPatternTo: z.string().optional().describe("Replacement value for internalUrlPatternFrom"),
+        navigationRootFrom: z.string().optional().describe("Optional explicit source navigation root"),
+        navigationRootTo: z.string().optional().describe("Optional explicit target navigation root"),
+        customReplacements: z.array(z.object({ from: z.string(), to: z.string(), label: z.string().optional() })).optional().describe("Additional safe string replacements applied only on whitelisted URL/path properties"),
+        translateText: z.boolean().default(false).describe("Must remain false in v1; text translation is intentionally not supported"),
+      },
+    },
+    async ({ xfPath, sourceLanguage, targetLanguage, internalUrlPatternFrom, internalUrlPatternTo, navigationRootFrom, navigationRootTo, customReplacements, translateText }) => {
+      if (config.readOnly) return readOnlyErr();
+      if (translateText) {
+        return err("adaptXFContent does not support translateText=true in v1");
+      }
+      try {
+        const xfData = await client.getJson(xfPath, "infinity");
+        const { adaptedContent, result } = adaptExperienceFragmentData(xfPath, xfData, {
+          sourceLanguage,
+          targetLanguage,
+          internalUrlPatternFrom,
+          internalUrlPatternTo,
+          navigationRootFrom,
+          navigationRootTo,
+          customReplacements,
+        });
+        const sanitizedContent = sanitizeJcrSubtree(adaptedContent);
+        await client.slingImport(xfPath, sanitizedContent as Record<string, unknown>, {
+          replace: true,
+          replaceProperties: true,
+        });
+
+        return ok(result as AemExperienceFragmentAdaptationResult);
+      } catch (e: any) {
+        return err(`adaptXFContent failed: ${e.message}`);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
   // cloneExperienceFragment
   // -------------------------------------------------------------------------
   server.registerTool(
     "cloneExperienceFragment",
     {
-      description: "Clone an Experience Fragment subtree to a new path, preserving its JCR structure.",
+      description: "Clone an Experience Fragment subtree to a new path. Supports optional parent-folder creation and post-clone analysis.",
       inputSchema: {
         sourceXfPath: z.string().describe("Source Experience Fragment path to clone"),
         targetXfPath: z.string().describe("Target Experience Fragment path to create"),
         overwrite: z.boolean().default(false).describe("If true, delete the target subtree before cloning"),
+        createParentFolders: z.boolean().default(false).describe("If true, create missing parent folders under the target XF base path before cloning"),
+        postCloneAnalysis: z.boolean().default(false).describe("If true, return conservative metadata about untranslated text and manual review needs"),
       },
     },
-    async ({ sourceXfPath, targetXfPath, overwrite }) => {
+    async ({ sourceXfPath, targetXfPath, overwrite, createParentFolders, postCloneAnalysis }) => {
       if (config.readOnly) return readOnlyErr();
       try {
+        const targetParentPath = getParentPath(targetXfPath);
+        const targetBasePath = deriveExperienceFragmentBasePath(targetXfPath);
+        if (createParentFolders) {
+          await ensureFolderPath(client, {
+            path: targetParentPath,
+            rootPath: targetBasePath,
+          });
+        }
+
         const cloneResult = await cloneJcrSubtree(client, {
           sourcePath: sourceXfPath,
           targetPath: targetXfPath,
@@ -110,6 +329,11 @@ export function registerExperienceFragmentTools(
           variationNames,
           verification: cloneResult.verification,
         };
+
+        if (postCloneAnalysis) {
+          const inspection = inspectExperienceFragmentData(targetXfPath, cloneResult.sanitizedContent, targetBasePath);
+          result.contentMetadata = buildPostCloneAnalysis(inspection, 0);
+        }
 
         return ok(result);
       } catch (e: any) {
@@ -134,7 +358,7 @@ export function registerExperienceFragmentTools(
     },
     async ({ path, template, limit, offset }) => {
       try {
-        const params: Record<string, any> = {
+        const params: Record<string, string | number> = {
           type: "cq:Page",
           path,
           property: "jcr:content/sling:resourceType",
@@ -151,10 +375,10 @@ export function registerExperienceFragmentTools(
         const result = await client.get("/bin/querybuilder.json", params);
         const hits = result.hits || [];
         return ok({
-          fragments: hits.map((h: any) => ({
+          fragments: hits.map((h: Record<string, unknown>) => ({
             path: h.path,
-            title: h["jcr:content"]?.["jcr:title"] || h.name,
-            lastModified: h["jcr:content"]?.["cq:lastModified"] || "",
+            title: (h["jcr:content"] as Record<string, unknown> | undefined)?.["jcr:title"] || h.name,
+            lastModified: (h["jcr:content"] as Record<string, unknown> | undefined)?.["cq:lastModified"] || "",
           })),
           totalCount: result.total || hits.length,
           limit,
@@ -172,57 +396,142 @@ export function registerExperienceFragmentTools(
   server.registerTool(
     "getExperienceFragmentTree",
     {
-      description: "Get a hierarchical tree view of Experience Fragments and their variations under a base path.",
+      description: "Get a hierarchical tree view of Experience Fragments with optional metadata and filters.",
       inputSchema: {
         basePath: z
           .string()
           .default("/content/experience-fragments")
           .describe("Root path to build the Experience Fragment tree from"),
+        filterByLanguage: z.string().optional().describe("Optional language filter, e.g. pl"),
+        filterByType: XF_TYPE_SCHEMA.optional().describe("Optional category filter, e.g. site or modals"),
+        filterByEmpty: z.boolean().optional().describe("Optional emptiness filter"),
+        includeContentSummary: z.boolean().default(false).describe("If true, include per-XF content summaries in the tree metadata"),
       },
     },
-    async ({ basePath }) => {
+    async ({ basePath, filterByLanguage, filterByType, filterByEmpty, includeContentSummary }) => {
       try {
-        const fragmentQuery = await client.get("/bin/querybuilder.json", {
-          path: basePath,
-          type: "cq:Page",
-          property: "jcr:content/sling:resourceType",
-          "property.value": "cq/experience-fragments/components/experiencefragment",
-          "p.limit": -1,
-          "p.hits": "selective",
-          "p.properties": "jcr:path jcr:content/jcr:title",
-          orderby: "jcr:path",
-        });
+        const fragments = await queryExperienceFragments(client, basePath);
+        const fragmentNodes: AemExperienceFragmentTreeNode[] = [];
+        const xfTreeNodes: Array<{
+          path: string;
+          title?: string;
+          language?: string;
+          lastModified?: string;
+          status?: string;
+          isEmpty?: boolean;
+          category?: string;
+          contentSummary?: ReturnType<typeof inspectExperienceFragmentData>["analysis"]["contentSummary"];
+        }> = [];
+        const variationNodes: Array<{ path: string; title?: string }> = [];
 
-        const variationQuery = await client.get("/bin/querybuilder.json", {
-          path: basePath,
-          type: "cq:Page",
-          property: "jcr:content/cq:xfVariantType",
-          "property.operation": "exists",
-          "p.limit": -1,
-          "p.hits": "selective",
-          "p.properties": "jcr:path jcr:content/jcr:title",
-          orderby: "jcr:path",
-        });
+        for (const fragment of fragments) {
+          const xfData = await client.getJson(fragment.path, "infinity");
+          const inspection = inspectExperienceFragmentData(fragment.path, xfData, basePath);
+          const language = inspection.language;
+          const category = inspection.category ?? detectExperienceFragmentCategory(fragment.path, basePath, inspection.language);
+          if (filterByLanguage && language !== filterByLanguage.toLowerCase()) {
+            continue;
+          }
+          if (filterByType && category !== filterByType) {
+            continue;
+          }
+          if (typeof filterByEmpty === "boolean" && inspection.analysis.isEmpty !== filterByEmpty) {
+            continue;
+          }
 
-        const fragmentNodes = (fragmentQuery.hits || []).map((hit: Record<string, unknown>) => ({
-          path: String(hit["jcr:path"] ?? hit["path"] ?? ""),
-          title: typeof hit["jcr:content/jcr:title"] === "string" ? hit["jcr:content/jcr:title"] : undefined,
-        }));
+          xfTreeNodes.push({
+            path: fragment.path,
+            title: inspection.title ?? fragment.title,
+            language,
+            lastModified: inspection.lastModified ?? fragment.lastModified,
+            status: inspection.status ?? toPublishedStatus(fragment.replicationAction),
+            isEmpty: inspection.analysis.isEmpty,
+            category,
+            contentSummary: includeContentSummary ? inspection.analysis.contentSummary : undefined,
+          });
+          variationNodes.push(...inspection.variationNodes.map((variationNode) => ({ path: variationNode.path, title: variationNode.title })));
+        }
 
-        const variationNodes = (variationQuery.hits || []).map((hit: Record<string, unknown>) => ({
-          path: String(hit["jcr:path"] ?? hit["path"] ?? ""),
-          title: typeof hit["jcr:content/jcr:title"] === "string" ? hit["jcr:content/jcr:title"] : undefined,
-        }));
-
-        const treeResult = buildExperienceFragmentTree(basePath, fragmentNodes, variationNodes);
+        const treeResult = buildExperienceFragmentTree(basePath, xfTreeNodes, variationNodes);
+        fragmentNodes.push(...treeResult.root.children);
         return ok({
-          basePath,
+          basePath: normalizeJcrPath(basePath),
+          filters: {
+            filterByLanguage: filterByLanguage ?? null,
+            filterByType: filterByType ?? null,
+            filterByEmpty: typeof filterByEmpty === "boolean" ? filterByEmpty : null,
+            includeContentSummary,
+          },
           tree: treeResult.tree,
-          nodes: treeResult.root.children as AemExperienceFragmentTreeNode[],
+          nodes: fragmentNodes,
           stats: treeResult.stats as AemExperienceFragmentTreeStats,
         });
       } catch (e: any) {
         return err(`getExperienceFragmentTree failed: ${e.message}`);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // compareXFStructure
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "compareXFStructure",
+    {
+      description: "Compare two Experience Fragments after sanitizing volatile JCR properties and classify their differences.",
+      inputSchema: {
+        sourcePath: z.string().describe("Source Experience Fragment path"),
+        targetPath: z.string().describe("Target Experience Fragment path"),
+      },
+    },
+    async ({ sourcePath, targetPath }) => {
+      try {
+        const sourceData = await client.getJson(sourcePath, "infinity");
+        const targetData = await client.getJson(targetPath, "infinity");
+        return ok(compareExperienceFragmentData(sourcePath, sourceData, targetPath, targetData) as AemExperienceFragmentCompareResult);
+      } catch (e: any) {
+        return err(`compareXFStructure failed: ${e.message}`);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // listXFByLanguage
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "listXFByLanguage",
+    {
+      description: "Group Experience Fragments by detected language and optionally include metadata about emptiness, variations, and content summary.",
+      inputSchema: {
+        xfBasePath: z.string().describe("Base Experience Fragment path to group"),
+        metadata: z.boolean().default(true).describe("If true, include emptiness, variation names, and content summary metadata"),
+      },
+    },
+    async ({ xfBasePath, metadata }) => {
+      try {
+        const fragments = await queryExperienceFragments(client, xfBasePath);
+        const languages: Record<string, { count: number; xfs: AemExperienceFragmentLanguageEntry[] }> = {};
+
+        for (const fragment of fragments) {
+          const xfData = await client.getJson(fragment.path, "infinity");
+          const inspection = inspectExperienceFragmentData(fragment.path, xfData, xfBasePath);
+          const languageKey = inspection.language ?? "unknown";
+          if (!languages[languageKey]) {
+            languages[languageKey] = { count: 0, xfs: [] };
+          }
+          languages[languageKey].xfs.push(
+            buildLanguageEntry(fragment.path, inspection.title ?? fragment.title, metadata, inspection)
+          );
+          languages[languageKey].count += 1;
+        }
+
+        return ok({
+          xfBasePath: normalizeJcrPath(xfBasePath),
+          metadata,
+          languages,
+        });
+      } catch (e: any) {
+        return err(`listXFByLanguage failed: ${e.message}`);
       }
     }
   );
@@ -263,10 +572,9 @@ export function registerExperienceFragmentTools(
           fd.append("./jcr:content/sling:resourceType", "cq/experience-fragments/components/experiencefragment");
           fd.append("./jcr:content/cq:template", template);
           if (description) fd.append("./jcr:content/jcr:description", description);
-          if (tags?.length) tags.forEach((t) => fd.append("./jcr:content/cq:tags", t));
+          if (tags?.length) tags.forEach((tag) => fd.append("./jcr:content/cq:tags", tag));
           await client.post(newXfPath, fd);
 
-          // Create default "master" variation
           const masterFd = new URLSearchParams();
           masterFd.append("./jcr:primaryType", "cq:Page");
           masterFd.append("./jcr:content/jcr:primaryType", "cq:PageContent");
@@ -283,7 +591,7 @@ export function registerExperienceFragmentTools(
           const fd = new URLSearchParams();
           if (title) fd.append("./jcr:content/jcr:title", title);
           if (description) fd.append("./jcr:content/jcr:description", description);
-          if (tags?.length) tags.forEach((t) => fd.append("./jcr:content/cq:tags", t));
+          if (tags?.length) tags.forEach((tag) => fd.append("./jcr:content/cq:tags", tag));
           await client.post(xfPath, fd);
           return ok({ action, path: xfPath });
         }
@@ -293,11 +601,13 @@ export function registerExperienceFragmentTools(
           if (!force) {
             try {
               const refs = await client.get(`${xfPath}.references.json`);
-              const referencing = refs?.pages?.filter((p: any) => p.path !== xfPath) || [];
+              const referencing = refs?.pages?.filter((page: { path: string }) => page.path !== xfPath) || [];
               if (referencing.length > 0) {
                 return err(`Cannot delete: XF is referenced by ${referencing.length} page(s). Use force=true to override.`);
               }
-            } catch {}
+            } catch {
+              // ignore reference lookup failures and continue to delete path
+            }
           }
           const fd = new URLSearchParams();
           fd.append(":operation", "delete");
