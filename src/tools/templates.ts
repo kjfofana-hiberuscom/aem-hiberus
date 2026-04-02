@@ -10,12 +10,24 @@ function err(msg: string) {
   return { content: [{ type: "text" as const, text: msg }], isError: true };
 }
 
-function getTemplatesPath(sitePath: string): string {
+function getTemplatesPaths(sitePath: string): string[] {
+  const paths: string[] = [];
+
+  // Primary: strip /content prefix, prepend /conf
   let p = sitePath.trim().replace(/\/+$/, "");
   if (p.startsWith("/content/")) p = p.replace("/content", "");
   if (!p.startsWith("/conf")) p = `/conf/${p.replace(/^\//, "")}`;
   if (!p.endsWith("/settings/wcm/templates")) p += "/settings/wcm/templates";
-  return p;
+  paths.push(p);
+
+  // Secondary: /conf/{last-segment}/settings/wcm/templates
+  const lastSegment = sitePath.trim().replace(/\/+$/, "").split("/").filter(Boolean).pop() ?? "";
+  if (lastSegment) {
+    const lastSegPath = `/conf/${lastSegment}/settings/wcm/templates`;
+    if (lastSegPath !== p) paths.push(lastSegPath);
+  }
+
+  return paths;
 }
 
 export function registerTemplateTools(
@@ -32,32 +44,53 @@ export function registerTemplateTools(
       description: "List AEM editable templates for a site or globally",
       inputSchema: {
         sitePath: z.string().optional().describe("Site path (e.g. /content/my-site or my-site). Omit for global templates."),
+        confPath: z.string().optional().describe("Direct /conf path to the templates folder (e.g. /conf/my-site/settings/wcm/templates). Takes priority over sitePath if provided."),
       },
     },
-    async ({ sitePath }) => {
+    async ({ sitePath, confPath }) => {
       try {
-        if (sitePath) {
-          const confPath = getTemplatesPath(sitePath);
+        // Build ordered list of candidate conf paths to attempt
+        const candidates: string[] = [];
+        if (confPath) {
+          let cp = confPath.trim().replace(/\/+$/, "");
+          if (!cp.endsWith("/settings/wcm/templates")) cp += "/settings/wcm/templates";
+          candidates.push(cp);
+        } else if (sitePath) {
+          candidates.push(...getTemplatesPaths(sitePath));
+        }
+
+        for (const candidatePath of candidates) {
           try {
-            const data = await client.get(`${confPath}.2.json`);
+            const data = await client.get(`${candidatePath}.2.json`);
             const templates: unknown[] = [];
-            for (const [key, value] of Object.entries(data as Record<string, any>)) {
+            for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
               if (key.startsWith("jcr:") || key.startsWith("sling:")) continue;
-              const v = value as any;
+              const v = value as Record<string, unknown>;
               if (v && typeof v === "object" && v["jcr:content"]) {
+                const content = v["jcr:content"] as Record<string, unknown>;
                 templates.push({
                   name: key,
-                  path: `${confPath}/${key}`,
-                  title: v["jcr:content"]["jcr:title"] || key,
-                  description: v["jcr:content"]["jcr:description"],
-                  allowedPaths: v["jcr:content"]["allowedPaths"],
-                  ranking: v["jcr:content"]["ranking"] || 0,
-                  status: v["jcr:content"]["status"] || "enabled",
+                  path: `${candidatePath}/${key}`,
+                  title: content["jcr:title"] || key,
+                  description: content["jcr:description"],
+                  allowedPaths: content["allowedPaths"],
+                  ranking: content["ranking"] || 0,
+                  status: content["status"] || "enabled",
                 });
               }
             }
-            return ok({ sitePath, templates, totalCount: templates.length, source: "site-specific" });
-          } catch {}
+            return ok({
+              sitePath: sitePath ?? confPath,
+              templates,
+              totalCount: templates.length,
+              source: "site-specific",
+              resolvedPath: candidatePath,
+            });
+          } catch { /* try next candidate */ }
+        }
+
+        if (candidates.length > 0) {
+          // All candidates failed — fall through to global
         }
 
         // Fallback: global paths
@@ -69,24 +102,25 @@ export function registerTemplateTools(
         for (const tplPath of globalPaths) {
           try {
             const data = await client.get(`${tplPath}.json`, { ":depth": "2" });
-            for (const [key, value] of Object.entries(data as Record<string, any>)) {
+            for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
               if (key.startsWith("jcr:") || key.startsWith("sling:")) continue;
-              const v = value as any;
+              const v = value as Record<string, unknown>;
               if (v && typeof v === "object") {
+                const content = (v["jcr:content"] ?? {}) as Record<string, unknown>;
                 allTemplates.push({
                   name: key,
                   path: `${tplPath}/${key}`,
-                  title: v["jcr:content"]?.["jcr:title"] || key,
-                  description: v["jcr:content"]?.["jcr:description"],
-                  allowedPaths: v["jcr:content"]?.["allowedPaths"],
-                  ranking: v["jcr:content"]?.["ranking"] || 0,
+                  title: content["jcr:title"] || key,
+                  description: content["jcr:description"],
+                  allowedPaths: content["allowedPaths"],
+                  ranking: content["ranking"] || 0,
                   source: tplPath.includes("/apps/") ? "apps" : "libs",
                 });
               }
             }
           } catch {}
         }
-        return ok({ sitePath: sitePath || "global", templates: allTemplates, totalCount: allTemplates.length, source: "global" });
+        return ok({ sitePath: sitePath ?? confPath ?? "global", templates: allTemplates, totalCount: allTemplates.length, source: "global" });
       } catch (e: any) {
         return err(`getTemplates failed: ${e.message}`);
       }

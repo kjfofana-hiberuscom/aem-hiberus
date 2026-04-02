@@ -113,47 +113,15 @@ export function registerSearchTools(
   );
 
   // -------------------------------------------------------------------------
-  // executeJCRQuery
-  // -------------------------------------------------------------------------
-  server.registerTool(
-    "executeJCRQuery",
-    {
-      description: "Execute a fulltext search on cq:Page nodes via QueryBuilder",
-      inputSchema: {
-        query: z.string().min(1).describe("Fulltext search term"),
-        path: z.string().default("/content").describe("JCR path to search under"),
-        limit: z.number().int().min(1).max(200).default(20).describe("Max results"),
-      },
-    },
-    async ({ query, path, limit }) => {
-      try {
-        if (/drop\s+table|exec\s*\(|<script/i.test(query) || query.length > 1000) {
-          return err("Query contains unsafe patterns or is too long");
-        }
-        const data = await client.get("/bin/querybuilder.json", {
-          path,
-          type: "cq:Page",
-          fulltext: query,
-          "p.limit": limit,
-          "p.hits": "full",
-        });
-        return ok({ query, results: data.hits || [], total: data.total || 0, limit });
-      } catch (e: any) {
-        return err(`executeJCRQuery failed: ${e.message}`);
-      }
-    }
-  );
-
-  // -------------------------------------------------------------------------
   // getNodeContent
   // -------------------------------------------------------------------------
   server.registerTool(
     "getNodeContent",
     {
-      description: "Get raw JCR node content as JSON",
+      description: "Get raw JCR node content as JSON. Use depth≥3 to include child nodes.",
       inputSchema: {
         path: z.string().describe("JCR node path (e.g. /content/site/en/home/jcr:content)"),
-        depth: z.number().int().min(1).max(10).default(1).describe("JSON depth"),
+        depth: z.number().int().min(1).max(10).default(3).describe("JSON depth (1=properties only, 3=with children, 10=deep tree). Default: 3"),
       },
     },
     async ({ path, depth }) => {

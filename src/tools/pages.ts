@@ -205,6 +205,7 @@ export function registerPageTools(
         }
         await client.post(`${newPagePath}/jcr:content`, contentFd);
 
+
         return ok({
           success: true,
           pagePath: newPagePath,
@@ -290,6 +291,360 @@ export function registerPageTools(
         } catch (e2: any) {
           return err(`deletePage failed: ${e1.message}`);
         }
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // diffPageContent
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "diffPageContent",
+    {
+      description:
+        "Compare expected content (headings, texts, links, contactData) against what is actually " +
+        "stored in an AEM page. Reads the live JCR tree via .infinity.json, extracts all relevant " +
+        "strings recursively, and returns only the divergences plus match metrics.",
+      inputSchema: {
+        pagePath: z.string().describe("Full JCR path to the page (e.g. /content/site/en/home)"),
+        expectedContent: z
+          .object({
+            headings: z
+              .array(
+                z.object({
+                  level: z.number().int().min(1).max(6).describe("Heading level (1–6)"),
+                  text: z.string().describe("Expected heading text"),
+                })
+              )
+              .optional()
+              .describe("Expected headings with level and normalized text"),
+            links: z
+              .array(
+                z.object({
+                  text: z.string().optional().describe("Expected link label (may be unavailable from JCR)"),
+                  url: z.string().describe("Expected link URL"),
+                })
+              )
+              .optional()
+              .describe("Expected links — compared by URL; text carried through for reporting"),
+            texts: z
+              .array(z.string())
+              .optional()
+              .describe("Expected body text strings (text, description, richText …)"),
+            contactData: z
+              .array(
+                z.object({
+                  label: z.string().optional().describe("Human-readable label (e.g. 'Phone', 'Email')"),
+                  value: z.string().describe("Expected contact value (phone, email, address)"),
+                })
+              )
+              .optional()
+              .describe("Expected contact data — compared by value; label carried through for reporting"),
+          })
+          .describe("Content to verify against the live page"),
+      },
+    },
+    async ({ pagePath, expectedContent }) => {
+      try {
+        const pageData = await client.get(`${pagePath}.infinity.json`);
+        const jcrContent = pageData["jcr:content"] as Record<string, unknown> | undefined;
+        if (!jcrContent) {
+          return err(`diffPageContent: no jcr:content found at ${pagePath}`);
+        }
+
+        // --- Extraction helpers -------------------------------------------
+
+        const HEADING_KEYS = new Set([
+          "jcr:title", "title", "heading", "headline", "subtitle", "label",
+        ]);
+        const TEXT_KEYS = new Set([
+          "text", "description", "jcr:description", "richText", "body",
+          "content", "summary", "paragraph",
+        ]);
+        const LINK_KEYS = new Set([
+          "linkURL", "link", "href", "fileReference", "ctaLink", "url", "actionLink",
+        ]);
+        const CONTACT_PATTERNS: RegExp[] = [
+          /\+?[\d][\d\s\-().]{5,}/g,         // phone numbers
+          /[\w.+\-]+@[\w\-]+\.[a-z]{2,}/gi,  // emails
+        ];
+
+        function stripHtml(raw: string): string {
+          return raw
+            .replace(/<[^>]*>/g, " ")
+            .replace(/&nbsp;/g, " ")
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&quot;/g, '"')
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+        }
+
+        function extractContactStrings(text: string): string[] {
+          const found: string[] = [];
+          for (const pattern of CONTACT_PATTERNS) {
+            const cloned = new RegExp(pattern.source, pattern.flags);
+            const matches = text.match(cloned);
+            if (matches) {
+              found.push(...matches.map((m) => m.trim()).filter((m) => m.length > 3));
+            }
+          }
+          return found;
+        }
+
+        interface Extracted {
+          headings: string[];
+          texts: string[];
+          links: string[];
+          contactData: string[];
+        }
+
+        function extractFromNode(node: Record<string, unknown>, acc: Extracted): void {
+          for (const [key, value] of Object.entries(node)) {
+            if (typeof value === "string" && value.trim().length > 0) {
+              if (HEADING_KEYS.has(key)) {
+                acc.headings.push(stripHtml(value));
+              } else if (LINK_KEYS.has(key)) {
+                acc.links.push(value.trim());
+              } else if (TEXT_KEYS.has(key)) {
+                const normalized = stripHtml(value);
+                acc.texts.push(normalized);
+                acc.contactData.push(...extractContactStrings(normalized));
+              }
+            } else if (
+              value !== null &&
+              typeof value === "object" &&
+              !Array.isArray(value)
+            ) {
+              extractFromNode(value as Record<string, unknown>, acc);
+            }
+          }
+        }
+
+        const extracted: Extracted = {
+          headings: [],
+          texts: [],
+          links: [],
+          contactData: [],
+        };
+        extractFromNode(jcrContent, extracted);
+
+        // --- Fuzzy similarity (bigram) ------------------------------------
+
+        function bigramSimilarity(a: string, b: string): number {
+          if (a === b) return 1;
+          if (a.length === 0 || b.length === 0) return 0;
+          if (a.includes(b) || b.includes(a)) return 1;
+          const bigrams = (s: string): Map<string, number> => {
+            const m = new Map<string, number>();
+            for (let i = 0; i < s.length - 1; i++) {
+              const bg = s.slice(i, i + 2);
+              m.set(bg, (m.get(bg) ?? 0) + 1);
+            }
+            return m;
+          };
+          const bA = bigrams(a);
+          const bB = bigrams(b);
+          let intersection = 0;
+          for (const [bg, countA] of bA) {
+            const countB = bB.get(bg) ?? 0;
+            intersection += Math.min(countA, countB);
+          }
+          const totalA = [...bA.values()].reduce((s, c) => s + c, 0);
+          const totalB = [...bB.values()].reduce((s, c) => s + c, 0);
+          return totalA + totalB === 0 ? 0 : (2 * intersection) / (totalA + totalB);
+        }
+
+        const FUZZY_THRESHOLD = 0.72;
+
+        type ExpectedHeading = { level: number; text: string };
+        type ExpectedLink = { text?: string; url: string };
+        type ExpectedContact = { label?: string; value: string };
+
+        interface Divergence {
+          type: "heading" | "text" | "link" | "contactData";
+          expected: ExpectedHeading | ExpectedLink | ExpectedContact | string;
+          bestMatch: string | null;
+          score: number;
+        }
+
+        interface MissingItem {
+          type: "heading" | "text" | "link" | "contactData";
+          value: ExpectedHeading | ExpectedLink | ExpectedContact | string;
+        }
+
+        function compareTexts(
+          expected: string[],
+          actual: string[],
+          divergences: Divergence[],
+          missing: MissingItem[]
+        ): { matched: number } {
+          let matched = 0;
+          for (const exp of expected) {
+            const expNorm = stripHtml(exp);
+            let bestScore = 0;
+            let bestMatch: string | null = null;
+            for (const act of actual) {
+              const score = bigramSimilarity(expNorm, act);
+              if (score > bestScore) { bestScore = score; bestMatch = act; }
+            }
+            if (bestScore >= FUZZY_THRESHOLD) {
+              matched++;
+            } else if (bestMatch !== null) {
+              divergences.push({ type: "text", expected: exp, bestMatch, score: bestScore });
+            } else {
+              missing.push({ type: "text", value: exp });
+            }
+          }
+          return { matched };
+        }
+
+        function compareHeadings(
+          expected: ExpectedHeading[],
+          actual: string[],
+          divergences: Divergence[],
+          missing: MissingItem[]
+        ): { matched: number } {
+          let matched = 0;
+          for (const exp of expected) {
+            const expNorm = stripHtml(exp.text);
+            let bestScore = 0;
+            let bestMatch: string | null = null;
+            for (const act of actual) {
+              const score = bigramSimilarity(expNorm, act);
+              if (score > bestScore) { bestScore = score; bestMatch = act; }
+            }
+            if (bestScore >= FUZZY_THRESHOLD) {
+              matched++;
+            } else if (bestMatch !== null) {
+              divergences.push({ type: "heading", expected: exp, bestMatch, score: bestScore });
+            } else {
+              missing.push({ type: "heading", value: exp });
+            }
+          }
+          return { matched };
+        }
+
+        function compareLinks(
+          expected: ExpectedLink[],
+          actual: string[],
+          divergences: Divergence[],
+          missing: MissingItem[]
+        ): { matched: number } {
+          let matched = 0;
+          for (const exp of expected) {
+            const expUrl = exp.url.trim().toLowerCase();
+            let bestScore = 0;
+            let bestMatch: string | null = null;
+            for (const act of actual) {
+              const score = bigramSimilarity(expUrl, act.trim().toLowerCase());
+              if (score > bestScore) { bestScore = score; bestMatch = act; }
+            }
+            if (bestScore >= FUZZY_THRESHOLD) {
+              matched++;
+            } else if (bestMatch !== null) {
+              divergences.push({ type: "link", expected: exp, bestMatch, score: bestScore });
+            } else {
+              missing.push({ type: "link", value: exp });
+            }
+          }
+          return { matched };
+        }
+
+        function compareContactData(
+          expected: ExpectedContact[],
+          actual: string[],
+          divergences: Divergence[],
+          missing: MissingItem[]
+        ): { matched: number } {
+          let matched = 0;
+          for (const exp of expected) {
+            const expNorm = stripHtml(exp.value);
+            let bestScore = 0;
+            let bestMatch: string | null = null;
+            for (const act of actual) {
+              const score = bigramSimilarity(expNorm, act);
+              if (score > bestScore) { bestScore = score; bestMatch = act; }
+            }
+            if (bestScore >= FUZZY_THRESHOLD) {
+              matched++;
+            } else if (bestMatch !== null) {
+              divergences.push({ type: "contactData", expected: exp, bestMatch, score: bestScore });
+            } else {
+              missing.push({ type: "contactData", value: exp });
+            }
+          }
+          return { matched };
+        }
+
+        // --- Run comparison -----------------------------------------------
+
+        const divergences: Divergence[] = [];
+        const missing: MissingItem[] = [];
+        let totalChecks = 0;
+        let matchCount = 0;
+
+        if (expectedContent.headings?.length) {
+          totalChecks += expectedContent.headings.length;
+          const { matched } = compareHeadings(
+            expectedContent.headings,
+            extracted.headings,
+            divergences,
+            missing
+          );
+          matchCount += matched;
+        }
+
+        if (expectedContent.texts?.length) {
+          totalChecks += expectedContent.texts.length;
+          const { matched } = compareTexts(
+            expectedContent.texts,
+            extracted.texts,
+            divergences,
+            missing
+          );
+          matchCount += matched;
+        }
+
+        if (expectedContent.links?.length) {
+          totalChecks += expectedContent.links.length;
+          const { matched } = compareLinks(
+            expectedContent.links,
+            extracted.links,
+            divergences,
+            missing
+          );
+          matchCount += matched;
+        }
+
+        if (expectedContent.contactData?.length) {
+          totalChecks += expectedContent.contactData.length;
+          const { matched } = compareContactData(
+            expectedContent.contactData,
+            extracted.contactData,
+            divergences,
+            missing
+          );
+          matchCount += matched;
+        }
+
+        const matchPercentage =
+          totalChecks === 0 ? 100 : Math.round((matchCount / totalChecks) * 100);
+
+        return ok({
+          pagePath,
+          totalChecks,
+          matchCount,
+          divergenceCount: divergences.length + missing.length,
+          divergences,
+          missing,
+          matchPercentage,
+        });
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return err(`diffPageContent failed: ${msg}`);
       }
     }
   );

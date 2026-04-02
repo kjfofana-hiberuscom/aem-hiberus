@@ -41,7 +41,7 @@ function buildMcpServer(config: ReturnType<typeof loadConfig>): McpServer {
   const server = new McpServer({
     name: "mcp-aem-hiberus",
     version: "1.0.0",
-    description: "AEM MCP Server — 54 tools covering sites, pages, components, search, templates, publishing, workflows, content fragments, assets, and XF-first language automation workflows",
+    description: "AEM MCP Server — 56 tools covering sites, pages, components, search, templates, publishing, workflows, content fragments, assets, and XF-first language automation workflows",
   });
 
   registerSiteTools(server, client, config);

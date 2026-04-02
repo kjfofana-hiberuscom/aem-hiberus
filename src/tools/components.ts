@@ -163,6 +163,149 @@ function filterProps(node: any): Record<string, unknown> {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Policy resolution helpers
+// ---------------------------------------------------------------------------
+
+interface Style {
+  "cq:styleId": string;
+  "cq:styleClasses": string | string[];
+  "cq:styleLabel": string;
+}
+
+interface StyleGroup {
+  label: string;
+  id: string;
+  styles: Style[];
+}
+
+interface PolicyResult {
+  mechanism: "styleSystem" | "cssClass" | "none";
+  styleGroups: StyleGroup[];
+  defaultClasses: string[];
+  policyPath: string | null;
+  rawPolicy: Record<string, unknown> | null;
+}
+
+/** Return the path up to and including the jcr:content segment. */
+function findJcrContentPath(jcrPath: string): string | null {
+  const parts = jcrPath.split("/");
+  const idx = parts.lastIndexOf("jcr:content");
+  if (idx === -1) return null;
+  return parts.slice(0, idx + 1).join("/");
+}
+
+/** Parse one AEM Style System group node into Style entries. */
+function parseStylesFromGroup(g: Record<string, unknown>): Style[] {
+  const styles: Style[] = [];
+  const rawStyles = g["cq:styles"] ?? g["values"];
+  if (!rawStyles || typeof rawStyles !== "object") return styles;
+
+  if (!Array.isArray(rawStyles)) {
+    // Object format: child nodes via .infinity.json
+    for (const [styleKey, styleVal] of Object.entries(rawStyles as Record<string, unknown>)) {
+      if (styleKey.startsWith("jcr:") || typeof styleVal !== "object" || styleVal === null) continue;
+      const s = styleVal as Record<string, unknown>;
+      styles.push({
+        "cq:styleId": String(s["cq:styleId"] ?? s["value"] ?? styleKey),
+        "cq:styleClasses": Array.isArray(s["cq:styleClasses"])
+          ? (s["cq:styleClasses"] as string[])
+          : String(s["cq:styleClasses"] ?? s["value"] ?? ""),
+        "cq:styleLabel": String(s["cq:styleLabel"] ?? s["label"] ?? styleKey),
+      });
+    }
+  } else {
+    // Array format
+    for (const styleItem of rawStyles as Record<string, unknown>[]) {
+      if (typeof styleItem !== "object" || styleItem === null) continue;
+      const s = styleItem as Record<string, unknown>;
+      styles.push({
+        "cq:styleId": String(s["cq:styleId"] ?? s["value"] ?? ""),
+        "cq:styleClasses": Array.isArray(s["cq:styleClasses"])
+          ? (s["cq:styleClasses"] as string[])
+          : String(s["cq:styleClasses"] ?? s["value"] ?? ""),
+        "cq:styleLabel": String(s["cq:styleLabel"] ?? s["label"] ?? ""),
+      });
+    }
+  }
+  return styles;
+}
+
+/** Parse a raw policy node to detect mechanism, styleGroups and defaultClasses. */
+function parsePolicyData(
+  rawPolicy: Record<string, unknown> | null
+): Pick<PolicyResult, "mechanism" | "styleGroups" | "defaultClasses"> {
+  if (!rawPolicy) {
+    return { mechanism: "none", styleGroups: [], defaultClasses: [] };
+  }
+
+  const styleGroups: StyleGroup[] = [];
+  const defaultClasses: string[] = [];
+
+  // AEM Style System: cq:styleGroups can be an object (JCR child nodes) or an array
+  const rawStyleGroups = rawPolicy["cq:styleGroups"] ?? rawPolicy["styleGroups"];
+  if (rawStyleGroups && typeof rawStyleGroups === "object") {
+    if (!Array.isArray(rawStyleGroups)) {
+      // Object format: each key is a group node (from .infinity.json)
+      for (const [groupKey, groupVal] of Object.entries(rawStyleGroups as Record<string, unknown>)) {
+        if (groupKey.startsWith("jcr:") || typeof groupVal !== "object" || groupVal === null) continue;
+        const g = groupVal as Record<string, unknown>;
+        styleGroups.push({
+          label: String(g["cq:styleGroupLabel"] ?? g["label"] ?? groupKey),
+          id: String(g["id"] ?? groupKey),
+          styles: parseStylesFromGroup(g),
+        });
+      }
+    } else if ((rawStyleGroups as unknown[]).length > 0) {
+      // Array format
+      for (const group of rawStyleGroups as Record<string, unknown>[]) {
+        if (typeof group !== "object" || group === null) continue;
+        const g = group as Record<string, unknown>;
+        styleGroups.push({
+          label: String(g["cq:styleGroupLabel"] ?? g["label"] ?? ""),
+          id: String(g["id"] ?? ""),
+          styles: parseStylesFromGroup(g),
+        });
+      }
+    }
+  }
+
+  if (styleGroups.length > 0) {
+    return { mechanism: "styleSystem", styleGroups, defaultClasses };
+  }
+
+  // CSS class mechanism: look for defaultClasses or cq:defaultClasses
+  const rawDefault = rawPolicy["defaultClasses"] ?? rawPolicy["cq:defaultClasses"];
+  if (rawDefault) {
+    if (Array.isArray(rawDefault)) {
+      defaultClasses.push(...(rawDefault as string[]));
+    } else if (typeof rawDefault === "string" && rawDefault.trim()) {
+      defaultClasses.push(...rawDefault.split(/\s+/).filter(Boolean));
+    }
+    if (defaultClasses.length > 0) {
+      return { mechanism: "cssClass", styleGroups: [], defaultClasses };
+    }
+  }
+
+  return { mechanism: "none", styleGroups: [], defaultClasses: [] };
+}
+
+/** Try to GET a policy node; returns parsed JSON or null on any failure. */
+async function fetchPolicyAtPath(
+  client: AemClient,
+  policyPath: string
+): Promise<Record<string, unknown> | null> {
+  try {
+    const data = await client.get(`${policyPath}.infinity.json`);
+    if (data && typeof data === "object" && Object.keys(data).length > 0) {
+      return data as Record<string, unknown>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function registerComponentTools(
   server: McpServer,
   client: AemClient,
@@ -355,58 +498,6 @@ export function registerComponentTools(
         } catch {
           return err(`deleteComponent failed: ${e1.message}`);
         }
-      }
-    }
-  );
-
-  // -------------------------------------------------------------------------
-  // createComponent
-  // -------------------------------------------------------------------------
-  server.registerTool(
-    "createComponent",
-    {
-      description: "Create a component node at a specific JCR path using Sling import",
-      inputSchema: {
-        pagePath: z.string().describe("Page path (used for path validation)"),
-        componentPath: z.string().optional().describe("Full target JCR path for the new node. If omitted, derived from pagePath+name."),
-        resourceType: z.string().describe("Sling resource type (no whitelist restriction)"),
-        name: z.string().optional().describe("Component node name"),
-        properties: z.record(z.unknown()).optional().describe("Flat properties to set on the component node"),
-        subNodes: subNodeSchema.optional().describe(
-          "Recursive child JCR sub-nodes. Key = node name, value = node properties + optional nested 'subNodes'."
-        ),
-      },
-    },
-    async ({ pagePath, componentPath, resourceType, name, properties = {}, subNodes }) => {
-      if (config.readOnly) return readOnlyErr();
-      try {
-        const componentName = name || `${resourceType.split("/").pop()}_${Date.now()}`;
-        const targetPath = componentPath || `${pagePath}/jcr:content/${componentName}`;
-
-        // Build JSON content — recursive subNodes are embedded as a nested tree for Sling import
-        const content: Record<string, unknown> = {
-          "jcr:primaryType": "nt:unstructured",
-          "sling:resourceType": resourceType,
-          ...properties,
-          ...(subNodes ? flattenSubNodes(subNodes) : {}),
-        };
-
-        await client.slingImport(targetPath, content);
-
-        const allSubNodePaths = subNodes
-          ? collectSubNodePaths(subNodes, targetPath)
-          : undefined;
-
-        return ok({
-          success: true,
-          componentPath: targetPath,
-          resourceType,
-          properties,
-          subNodes: allSubNodePaths,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (e: any) {
-        return err(`createComponent failed: ${e.message}`);
       }
     }
   );
@@ -639,20 +730,168 @@ export function registerComponentTools(
       }
     }
   );
-}
 
-// ---------------------------------------------------------------------------
-// Internal helper: collect all sub-node absolute paths from a SubNodeTree
-// ---------------------------------------------------------------------------
-function collectSubNodePaths(tree: SubNodeTree, parentPath: string): string[] {
-  const paths: string[] = [];
-  for (const [name, rawNode] of Object.entries(tree)) {
-    const nodePath = `${parentPath}/${name}`;
-    paths.push(nodePath);
-    const { subNodes } = rawNode as SubNodeDef;
-    if (subNodes) {
-      paths.push(...collectSubNodePaths(subNodes, nodePath));
+  // -------------------------------------------------------------------------
+  // getComponentPolicy
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "getComponentPolicy",
+    {
+      description:
+        "Get the AEM policy (Style System groups, CSS classes) applied to a component. " +
+        "Resolves the policy via cq:policy on the component node, cq:designPath heuristic, " +
+        "or /conf-based path. Returns mechanism (styleSystem | cssClass | none), styleGroups, " +
+        "defaultClasses, resolved policyPath and the rawPolicy node.",
+      inputSchema: {
+        componentPath: z
+          .string()
+          .describe("Full JCR path to the component node"),
+        policyPath: z
+          .string()
+          .optional()
+          .describe(
+            "Explicit full JCR path to the policy node. When omitted the policy is resolved heuristically."
+          ),
+      },
+    },
+    async ({ componentPath, policyPath: explicitPolicyPath }) => {
+      try {
+        // Step 1: read component — capture resourceType and inline cq:policy
+        let resourceType = "";
+        let inlinePolicyRef: string | undefined;
+        try {
+          const compNode = await client.get(`${componentPath}.json`);
+          resourceType = String(compNode?.["sling:resourceType"] ?? "");
+          if (!explicitPolicyPath && typeof compNode?.["cq:policy"] === "string") {
+            inlinePolicyRef = compNode["cq:policy"] as string;
+          }
+        } catch (e: any) {
+          return err(
+            `getComponentPolicy: cannot read component at ${componentPath}: ${e.message}`
+          );
+        }
+
+        let resolvedPolicyPath: string | null = null;
+        let rawPolicy: Record<string, unknown> | null = null;
+
+        // Step 2a: explicit or inline cq:policy reference
+        const primaryPath = explicitPolicyPath ?? inlinePolicyRef;
+        if (primaryPath) {
+          rawPolicy = await fetchPolicyAtPath(client, primaryPath);
+          if (rawPolicy) resolvedPolicyPath = primaryPath;
+        }
+
+        // Step 2b: cq:designPath heuristic — walk up to jcr:content
+        if (!rawPolicy) {
+          const jcrContentPath = findJcrContentPath(componentPath);
+          if (jcrContentPath) {
+            const jcrContent = await client
+              .get(`${jcrContentPath}.json`)
+              .catch(() => null);
+            const designPath = jcrContent?.["cq:designPath"] as string | undefined;
+            if (designPath) {
+              const candidates: string[] = [];
+              if (resourceType) {
+                candidates.push(`${designPath}/jcr:content/${resourceType}`);
+              }
+              candidates.push(`${designPath}/jcr:content`);
+              for (const candidate of candidates) {
+                rawPolicy = await fetchPolicyAtPath(client, candidate);
+                if (rawPolicy) {
+                  resolvedPolicyPath = candidate;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        // Step 2c: /conf/{site}/settings/wcm/policies/{resourceType} heuristic
+        if (!rawPolicy && resourceType) {
+          const parts = componentPath.split("/");
+          if (parts[1] === "content" && parts[2]) {
+            const site = parts[2];
+            const confPath = `/conf/${site}/settings/wcm/policies/${resourceType}`;
+            rawPolicy = await fetchPolicyAtPath(client, confPath);
+            if (rawPolicy) resolvedPolicyPath = confPath;
+          }
+        }
+
+        // Step 3: parse policy data
+        const parsed = parsePolicyData(rawPolicy);
+
+        const result: PolicyResult = {
+          ...parsed,
+          policyPath: resolvedPolicyPath,
+          rawPolicy,
+        };
+        return ok(result);
+      } catch (e: any) {
+        return err(`getComponentPolicy failed: ${e.message}`);
+      }
     }
-  }
-  return paths;
+  );
+
+  // -------------------------------------------------------------------------
+  // moveComponent
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "moveComponent",
+    {
+      description:
+        "Move an AEM component node to a new JCR path. Optionally re-order it before a sibling node at the destination.",
+      inputSchema: {
+        sourcePath: z
+          .string()
+          .describe("Full JCR path to the component node to move"),
+        destinationPath: z
+          .string()
+          .describe("Full JCR destination path (including the new node name)"),
+        orderBefore: z
+          .string()
+          .optional()
+          .describe(
+            "Full JCR path of the sibling node before which the moved component should be placed. Omit to keep natural order."
+          ),
+      },
+    },
+    async ({ sourcePath, destinationPath, orderBefore }) => {
+      if (config.readOnly) return readOnlyErr();
+      try {
+        // Step 1: verify source exists
+        const sourceExists = await client.exists(sourcePath);
+        if (!sourceExists) {
+          return err(`moveComponent: source node not found at ${sourcePath}`);
+        }
+
+        // Step 2: move via Sling POST :operation=move
+        const moveFd = new URLSearchParams();
+        moveFd.append(":operation", "move");
+        moveFd.append(":dest", destinationPath);
+        await client.post(sourcePath, moveFd);
+
+        // Step 3: optional ordering — Sling POST :order=before {siblingName}
+        if (orderBefore) {
+          const siblingName = orderBefore.split("/").pop() ?? orderBefore;
+          const orderFd = new URLSearchParams();
+          orderFd.append(":order", `before ${siblingName}`);
+          await client.post(destinationPath, orderFd);
+        }
+
+        // Step 4: verify new node exists
+        const verification = await client.get(`${destinationPath}.json`);
+
+        return ok({
+          success: true,
+          sourcePath,
+          destinationPath,
+          ...(orderBefore ? { orderedBefore: orderBefore } : {}),
+          verification,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (e: any) {
+        return err(`moveComponent failed: ${e.message}`);
+      }
+    }
+  );
 }
