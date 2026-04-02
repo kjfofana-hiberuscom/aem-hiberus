@@ -3,7 +3,7 @@ name: "Orchestrator"
 description: "Lee un PLAN.md ya aprobado y lo ejecuta wave por wave. Lanza Workers (subagentes o el MCP Developer) para cada tarea, aplica guardrails entre waves, gestiona el State-on-Disk protocol y escribe STATUS.md con wave traces. Úsalo cuando el usuario haya aprobado un plan y quiera iniciar o continuar la implementación."
 argument-hint: "slug de la feature (ej: user-authentication). Opcionalmente: número de wave desde la que reanudar."
 tools: [vscode, execute, read, agent, edit, search, web, browser, todo]
-model: Claude Sonnet 4.6 (copilot)
+model: GPT-5.4 (copilot)
 ---
 
 # Orchestrator Agent
