@@ -31,6 +31,7 @@ import { registerWorkflowTools } from "./tools/workflows.js";
 import { registerContentFragmentTools } from "./tools/content-fragments.js";
 import { registerExperienceFragmentTools } from "./tools/experience-fragments.js";
 import { registerAssetTools } from "./tools/assets.js";
+import { registerCrxTools } from "./tools/crx.js";
 
 // ---------------------------------------------------------------------------
 // Server factory
@@ -42,7 +43,7 @@ function buildMcpServer(config: ReturnType<typeof loadConfig>): McpServer {
   const server = new McpServer({
     name: "mcp-aem-hiberus",
     version: "1.0.0",
-    description: "AEM MCP Server — 56 tools covering sites, pages, components, search, templates, publishing, workflows, content fragments, assets, and XF-first language automation workflows",
+    description: "AEM MCP Server — 60 tools covering sites, pages, components, search, templates, publishing, workflows, content fragments, assets, and XF-first language automation workflows",
   });
 
   registerSiteTools(server, client, config);
@@ -55,6 +56,7 @@ function buildMcpServer(config: ReturnType<typeof loadConfig>): McpServer {
   registerContentFragmentTools(server, client, config);
   registerExperienceFragmentTools(server, client, config);
   registerAssetTools(server, client, config);
+  registerCrxTools(server, client, config);
 
   return server;
 }

@@ -94,3 +94,16 @@ Salida en `./build/`.
 ```bash
 npx @modelcontextprotocol/inspector node build/index.js
 ```
+
+---
+
+## CRX Inspector Tools (4)
+
+Tools para inspección profunda de componentes AEM: definiciones JCR, diálogos, modelos Sling y comparación de instancias.
+
+| Tool | Descripción | Input principal | R/W |
+|---|---|---|---|
+| `getComponentDefinition` | Definición completa de un componente: metadatos JCR, campos de diálogo por tab, fuente HTL, Sling Models detectados y child templates. Resuelve la cadena `slingResourceSuperType` hasta 5 niveles. | `resourceType` | R |
+| `listAppComponents` | Lista todos los nodos `cq:Component` bajo `/apps/{appName}/components` agrupados por `componentGroup`. Incluye flag `hasDialog`. | `appName` | R |
+| `compareComponentInstances` | Diff profundo de dos instancias JCR de componente, ignorando propiedades volátiles (`jcr:uuid`, `jcr:created`, etc.). Útil para validar migraciones. Limita a 100 entradas de diff. | `referencePath`, `currentPath` | R |
+| `getSlingModelInfo` | Obtiene metadatos de un Sling Model desde la consola Felix (`/system/console/status-slingmodels`): adaptables, interfaz adaptadora y binding de resourceType. Fallback a extracción desde `data-sly-use` en HTL si Felix no está disponible. | `resourceType` o `className` | R |
