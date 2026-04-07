@@ -106,6 +106,37 @@ const FIELD_TYPE_MAP: Readonly<Record<string, string>> = {
   "granite/ui/components/coral/foundation/form/colorfield": "color",
 };
 
+/**
+ * Suffix-based fallback: maps the last segment of a custom RT to a logical type.
+ * Handles custom wrappers like "myapp/form/richtext" → "richtext".
+ */
+const FIELD_TYPE_SUFFIX_MAP: Readonly<Record<string, string>> = {
+  textfield: "text",
+  textarea: "textarea",
+  checkbox: "checkbox",
+  select: "select",
+  pathfield: "pathfield",
+  pathbrowser: "pathfield",
+  multifield: "multifield",
+  richtext: "richtext",
+  hidden: "hidden",
+  numberfield: "number",
+  datepicker: "date",
+  colorfield: "color",
+  // common aliases found in ACS AEM Commons and custom toolkits
+  datefield: "date",
+  radiogroup: "select",
+  radiobuttons: "select",
+  switch: "checkbox",
+  togglefield: "checkbox",
+  autocomplete: "text",
+  drawtool: "image",
+  fileupload: "file",
+};
+
+/** Suffixes that unambiguously identify a form field even without an exact RT match */
+const FORM_FIELD_SUFFIXES = new Set<string>(Object.keys(FIELD_TYPE_SUFFIX_MAP));
+
 const VOLATILE_PROPS = new Set<string>([
   "jcr:uuid",
   "jcr:created",
@@ -142,17 +173,31 @@ async function fetchRawText(config: AemConfig, path: string): Promise<string | n
   }
 }
 
-/** Map a Granite UI sling:resourceType to a logical field type */
+/** Map a Granite UI sling:resourceType to a logical field type.
+ * Resolution order:
+ *   1. Exact match in FIELD_TYPE_MAP (fastest, most specific)
+ *   2. Suffix match via FIELD_TYPE_SUFFIX_MAP (tolerates custom/wrapper RTs)
+ *   3. Falls back to "unknown:{RT}" so the raw RT is still visible to the agent
+ */
 function mapFieldType(rt: string): string {
-  return FIELD_TYPE_MAP[rt] ?? `unknown:${rt}`;
+  if (FIELD_TYPE_MAP[rt]) return FIELD_TYPE_MAP[rt];
+  const suffix = rt.split("/").pop() ?? "";
+  if (FIELD_TYPE_SUFFIX_MAP[suffix]) return FIELD_TYPE_SUFFIX_MAP[suffix];
+  return `unknown:${rt}`;
 }
 
-/** Return true if the rt identifies a form field (not a layout/container) */
+/** Return true if the rt identifies a form field (not a layout/container).
+ * Checks exact Granite UI prefix first, then suffix-based fallback for custom RTs.
+ */
 function isFormField(rt: string): boolean {
-  return (
+  if (
     rt.startsWith("granite/ui/components/coral/foundation/form/") ||
     rt === "cq/gui/components/authoring/dialog/richtext"
-  );
+  ) {
+    return true;
+  }
+  const suffix = rt.split("/").pop() ?? "";
+  return FORM_FIELD_SUFFIXES.has(suffix);
 }
 
 /** Extract <option> list from a Granite select field's items sub-node */
@@ -421,47 +466,80 @@ function extractChildTemplates(htl: string): string[] {
 
 /**
  * Parse the plain-text output of /system/console/status-slingmodels.
- * Flexible enough to handle different AEM versions' formatting.
+ *
+ * The actual Felix console format (AEM 6.3+) uses single-line entries in the
+ * "Bound to Resource Types" sections:
+ *
+ *   Sling Models Bound to Resource Types *For Resources*:
+ *   com.example.MyModel - myapp/components/content/hero
+ *
+ * Additional "exports" lines follow some entries:
+ *   com.example.MyModel exports 'myapp/.../hero' with selector 'model' ...
+ *
+ * We parse all sections and build a deduplicated list keyed by className.
  */
 function parseSlingModelsText(text: string): ParsedModel[] {
-  const models: ParsedModel[] = [];
+  const byClass = new Map<string, ParsedModel>();
+
   const lines = text.split("\n");
-  let current: ParsedModel | null = null;
+  let inResourceSection = false;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
 
-    // Detect Java class name: at least two segments, last starts with uppercase
-    if (/^[a-z][a-zA-Z0-9_.]*\.[A-Z][a-zA-Z0-9_]+$/.test(line)) {
-      if (current) models.push(current);
-      current = {
-        className: line,
-        adaptables: [],
-        adapter: null,
-        resourceTypeBinding: null,
-      };
+    // Section headers
+    if (line.startsWith("Sling Models Bound to Resource Types")) {
+      inResourceSection = true;
+      continue;
+    }
+    if (line.startsWith("Sling Models ") && !line.startsWith("Sling Models Bound")) {
+      inResourceSection = false;
       continue;
     }
 
-    if (!current) continue;
+    if (inResourceSection) {
+      // Format: "com.example.MyModel - my/resource/type"
+      // OR:     "com.example.MyModel$InnerClass - my/resource/type"
+      const bindingMatch = line.match(
+        /^([a-z][a-zA-Z0-9_.]*\.[A-Z][a-zA-Z0-9_$]+)\s+-\s+(.+)$/
+      );
+      if (bindingMatch) {
+        const cls = bindingMatch[1];
+        const rt = bindingMatch[2].trim();
+        const existing = byClass.get(cls);
+        if (existing) {
+          if (!existing.resourceTypeBinding) existing.resourceTypeBinding = rt;
+        } else {
+          byClass.set(cls, {
+            className: cls,
+            adaptables: [],
+            adapter: null,
+            resourceTypeBinding: rt,
+          });
+        }
+        continue;
+      }
 
-    const lower = line.toLowerCase();
-    if (lower.startsWith("adaptable") && line.includes(":")) {
-      const val = line.slice(line.indexOf(":") + 1).trim();
-      const parsed = val.replace(/[\[\]]/g, "").split(",").map((s) => s.trim()).filter(Boolean);
-      current.adaptables.push(...parsed);
-    } else if (lower.startsWith("adapter") && line.includes(":")) {
-      const val = line.slice(line.indexOf(":") + 1).trim();
-      if (val) current.adapter = val;
-    } else if (lower.includes("resource type") && line.includes(":")) {
-      const colonIdx = line.lastIndexOf(":");
-      const val = line.slice(colonIdx + 1).trim();
-      if (val) current.resourceTypeBinding = val;
+      // Format: "com.example.MyModel exports 'my/resource/type' with selector ..."
+      const exportMatch = line.match(
+        /^([a-z][a-zA-Z0-9_.]*\.[A-Z][a-zA-Z0-9_$]+)\s+exports\s+'([^']+)'/
+      );
+      if (exportMatch) {
+        const cls = exportMatch[1];
+        const rt = exportMatch[2].trim();
+        if (!byClass.has(cls)) {
+          byClass.set(cls, {
+            className: cls,
+            adaptables: [],
+            adapter: null,
+            resourceTypeBinding: rt,
+          });
+        }
+      }
     }
   }
 
-  if (current) models.push(current);
-  return models;
+  return Array.from(byClass.values());
 }
 
 // ---------------------------------------------------------------------------
@@ -526,7 +604,9 @@ export function registerCrxTools(
         const childTemplates = htlSource ? extractChildTemplates(htlSource) : [];
 
         // PASO 4: Parse dialog
-        const dialogRaw = jcr["_cq_dialog"];
+        // AEM serializes _cq_dialog as either "_cq_dialog" (literal node name) or
+        // "cq:dialog" (namespace-qualified). We try both to handle both AEM versions.
+        const dialogRaw = jcr["_cq_dialog"] ?? jcr["cq:dialog"];
         const dialogNode =
           dialogRaw && typeof dialogRaw === "object" && !Array.isArray(dialogRaw)
             ? (dialogRaw as Record<string, unknown>)
@@ -589,20 +669,36 @@ export function registerCrxTools(
 
         const hits = ((compData["hits"] as Record<string, unknown>[] | undefined) ?? []);
 
-        // Query 2: find all _cq_dialog nodes to determine hasDialog
-        const dialogData = (await client
-          .get("/bin/querybuilder.json", {
-            nodename: "_cq_dialog",
-            path: basePath,
-            "p.limit": 500,
-            "p.hits": "full",
-          })
-          .catch(() => ({ hits: [] }))) as Record<string, unknown>;
+        // Query 2: find dialog nodes to determine hasDialog.
+        // AEM can store the touch-UI dialog as either '_cq_dialog' (literal node name)
+        // or 'cq:dialog' (namespace-qualified). We run two queries and merge.
+        const [dialogData1, dialogData2] = await Promise.all([
+          client
+            .get("/bin/querybuilder.json", {
+              nodename: "_cq_dialog",
+              path: basePath,
+              "p.limit": 500,
+              "p.hits": "full",
+            })
+            .catch(() => ({ hits: [] })) as Promise<Record<string, unknown>>,
+          client
+            .get("/bin/querybuilder.json", {
+              nodename: "cq:dialog",
+              path: basePath,
+              "p.limit": 500,
+              "p.hits": "full",
+            })
+            .catch(() => ({ hits: [] })) as Promise<Record<string, unknown>>,
+        ]);
 
+        const allDialogHits = [
+          ...((dialogData1["hits"] as Record<string, unknown>[] | undefined) ?? []),
+          ...((dialogData2["hits"] as Record<string, unknown>[] | undefined) ?? []),
+        ];
         const dialogParents = new Set<string>(
-          ((dialogData["hits"] as Record<string, unknown>[] | undefined) ?? []).map((h) => {
+          allDialogHits.map((h) => {
             const p = String(h["jcr:path"] ?? h["@path"] ?? "");
-            return p.replace(/\/_cq_dialog$/, "");
+            return p.replace(/\/_cq_dialog$/, "").replace(/\/cq:dialog$/, "");
           }).filter((p) => p.length > 0)
         );
 
@@ -753,7 +849,7 @@ export function registerCrxTools(
       // PASO 1–3: Attempt Felix console
       let consoleText: string | null = null;
       try {
-        consoleText = await fetchRawText(config, "/system/console/status-slingmodels");
+        consoleText = await fetchRawText(config, "/system/console/status-slingmodels.txt");
       } catch {
         /* Felix console unavailable — fall through */
       }
@@ -785,16 +881,8 @@ export function registerCrxTools(
         }
 
         if (models.length > 0) {
-          // Felix console reachable but model not found
-          const result: SlingModelInfo = {
-            className: className ?? resourceType ?? "",
-            adaptables: [],
-            adapter: null,
-            resourceTypeBinding: resourceType ?? null,
-            source: "felix-console",
-            note: `Model not found in Felix console (${models.length} models indexed). Searched by: ${resourceType ? `resourceType=${resourceType}` : `className=${className}`}`,
-          };
-          return ok(result);
+          // Felix console reachable but model not found by resourceType/className binding.
+          // Fall through to HTL-extraction fallback below (do not return early).
         }
       }
 
