@@ -13,6 +13,7 @@
  */
 
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -64,7 +65,7 @@ function buildMcpServer(config: ReturnType<typeof loadConfig>): McpServer {
 
 async function startStdio(): Promise<void> {
   const config = loadConfig();
-  const server = buildMcpServer(config);
+  const server = buildMcpServer(config); 
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
@@ -79,19 +80,68 @@ async function startStdio(): Promise<void> {
 async function startHttp(): Promise<void> {
   const config = loadConfig();
   const port = parseInt(process.env["PORT"] ?? "3000", 10);
+  if (Number.isNaN(port)) throw new Error(`Invalid PORT value: "${process.env["PORT"]}"`);
+
+  // Session store: each connected agent gets its own transport instance.
+  // Key = Mcp-Session-Id header value assigned on initialize.
+  const sessions = new Map<string, StreamableHTTPServerTransport>();
 
   const httpServer = createServer(async (req, res) => {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
-    const server = buildMcpServer(config);
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
+    try {
+      const rawHeader = req.headers["mcp-session-id"];
+      const sessionId = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
+
+      // Route to existing session
+      if (sessionId) {
+        const existing = sessions.get(sessionId);
+        if (existing) {
+          await existing.handleRequest(req, res);
+          return;
+        }
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Session not found" }, id: null }));
+        return;
+      }
+
+      // New connection — only POST is valid here (initialize request)
+      if (req.method !== "POST") {
+        res.writeHead(405, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "New connections must use POST" }, id: null }));
+        return;
+      }
+
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          sessions.set(sid, transport);
+          transport.onclose = () => {
+            sessions.delete(sid);
+            console.error(`[mcp-aem-hiberus] session closed | id=${sid} | active=${sessions.size}`);
+          };
+          console.error(`[mcp-aem-hiberus] session opened | id=${sid} | active=${sessions.size}`);
+        },
+      });
+
+      const server = buildMcpServer(config);
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (err) {
+      console.error("[mcp-aem-hiberus] request error:", err);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal error" },
+          id: null,
+        }));
+      }
+    }
   });
 
-  httpServer.listen(port, () => {
+  // Bind to localhost only — no need to expose on all interfaces for local multi-agent use.
+  httpServer.listen(port, "127.0.0.1", () => {
     console.error(
-      `[mcp-aem-hiberus] http | port=${port} | aemUrl=${config.aemUrl} | readOnly=${config.readOnly}`
+      `[mcp-aem-hiberus] http | port=${port} | host=127.0.0.1 | aemUrl=${config.aemUrl} | readOnly=${config.readOnly}`
     );
   });
 }
