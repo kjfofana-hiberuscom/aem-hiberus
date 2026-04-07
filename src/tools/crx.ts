@@ -240,21 +240,25 @@ function parseField(node: Record<string, unknown>): DialogField {
     // Try 'field' sub-node first (AEM Classic multifield pattern)
     const fieldDef = node["field"];
     if (fieldDef && typeof fieldDef === "object" && !Array.isArray(fieldDef)) {
-      const subRt = String((fieldDef as Record<string, unknown>)["sling:resourceType"] ?? "");
-      if (subRt) field.subFields = [parseField(fieldDef as Record<string, unknown>)];
-    }
-    // Also check items inside multifield (composite multifield)
-    const itemsNode = node["items"];
-    if (itemsNode && typeof itemsNode === "object" && !Array.isArray(itemsNode)) {
-      const subs: DialogField[] = [];
-      for (const [, v] of Object.entries(itemsNode as Record<string, unknown>)) {
-        if (v && typeof v === "object" && !Array.isArray(v)) {
-          const child = v as Record<string, unknown>;
-          const childRt = String(child["sling:resourceType"] ?? "");
-          if (isFormField(childRt)) subs.push(parseField(child));
-        }
+      const subNode = fieldDef as Record<string, unknown>;
+      const subRt = String(subNode["sling:resourceType"] ?? "");
+      if (isFormField(subRt)) {
+        // Simple multifield: 'field' IS a direct form element
+        field.subFields = [parseField(subNode)];
+      } else if (subRt) {
+        // Composite multifield: 'field' is a container (accordion, tabs, nested container…)
+        // collectFields recurses through any nesting depth to extract the real form fields
+        const nested = collectFields(subNode);
+        if (nested.length > 0) field.subFields = nested;
       }
-      if (subs.length > 0) field.subFields = subs;
+    }
+    // Fallback: direct 'items' inside multifield (older composite multifield pattern)
+    if (!field.subFields) {
+      const itemsNode = node["items"];
+      if (itemsNode && typeof itemsNode === "object" && !Array.isArray(itemsNode)) {
+        const subs = collectFields(itemsNode as Record<string, unknown>);
+        if (subs.length > 0) field.subFields = subs;
+      }
     }
   }
 
@@ -285,11 +289,10 @@ function collectFields(node: Record<string, unknown>): DialogField[] {
     if (isFormField(rt)) {
       fields.push(parseField(child));
     } else {
-      // Container or layout — recurse into its items sub-node if present
-      const itemsNode = child["items"];
-      if (itemsNode && typeof itemsNode === "object" && !Array.isArray(itemsNode)) {
-        fields.push(...collectFields(itemsNode as Record<string, unknown>));
-      }
+      // Container, accordion, layout — recurse directly into the node.
+      // This handles any nesting depth (accordion → items → container → items → fields)
+      // without needing to predict the intermediate structure.
+      fields.push(...collectFields(child));
     }
   }
   return fields;
@@ -370,7 +373,13 @@ async function resolveSuperTypeChain(
       try {
         // eslint-disable-next-line no-await-in-loop
         const data = (await client.getJson(tryPath, 1)) as Record<string, unknown>;
-        const st = data["sling:resourceSuperType"];
+        let st = data["sling:resourceSuperType"];
+        // Fallback: some AEM projects store sling:resourceSuperType in jcr:content
+        // depth=1 includes jcr:content as an immediate child, so it's available here
+        if ((typeof st !== "string" || !st) && data["jcr:content"]) {
+          const content = data["jcr:content"] as Record<string, unknown>;
+          st = content["sling:resourceSuperType"];
+        }
         if (typeof st === "string" && st.length > 0) {
           nextSuperType = st;
         }
@@ -483,6 +492,10 @@ function parseSlingModelsText(text: string): ParsedModel[] {
 
   const lines = text.split("\n");
   let inResourceSection = false;
+  // Tracks the adaptable inferred from the current section header:
+  //   "For Resources"  → org.apache.sling.api.resource.Resource
+  //   "For Requests"   → org.apache.sling.api.SlingHttpServletRequest
+  let currentAdaptable: string | null = null;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -490,10 +503,18 @@ function parseSlingModelsText(text: string): ParsedModel[] {
     // Section headers
     if (line.startsWith("Sling Models Bound to Resource Types")) {
       inResourceSection = true;
+      if (line.includes("For Resources")) {
+        currentAdaptable = "org.apache.sling.api.resource.Resource";
+      } else if (line.includes("For Requests")) {
+        currentAdaptable = "org.apache.sling.api.SlingHttpServletRequest";
+      } else {
+        currentAdaptable = null;
+      }
       continue;
     }
     if (line.startsWith("Sling Models ") && !line.startsWith("Sling Models Bound")) {
       inResourceSection = false;
+      currentAdaptable = null;
       continue;
     }
 
@@ -509,10 +530,13 @@ function parseSlingModelsText(text: string): ParsedModel[] {
         const existing = byClass.get(cls);
         if (existing) {
           if (!existing.resourceTypeBinding) existing.resourceTypeBinding = rt;
+          if (currentAdaptable && !existing.adaptables.includes(currentAdaptable)) {
+            existing.adaptables.push(currentAdaptable);
+          }
         } else {
           byClass.set(cls, {
             className: cls,
-            adaptables: [],
+            adaptables: currentAdaptable ? [currentAdaptable] : [],
             adapter: null,
             resourceTypeBinding: rt,
           });
@@ -530,7 +554,7 @@ function parseSlingModelsText(text: string): ParsedModel[] {
         if (!byClass.has(cls)) {
           byClass.set(cls, {
             className: cls,
-            adaptables: [],
+            adaptables: currentAdaptable ? [currentAdaptable] : [],
             adapter: null,
             resourceTypeBinding: rt,
           });
@@ -563,7 +587,7 @@ export function registerCrxTools(
         resourceType: z
           .string()
           .describe(
-            'Component resource type (e.g. "caixa-international/components/content/hero-carousel") or path with /apps/ prefix'
+            'Component resource type (e.g. "myapp/components/content/hero") or path with /apps/ prefix'
           ),
       },
     },
@@ -588,7 +612,15 @@ export function registerCrxTools(
         const isContainer =
           jcr["cq:isContainer"] === true || jcr["cq:isContainer"] === "true";
         const rawSuperType = jcr["sling:resourceSuperType"];
-        const superType = typeof rawSuperType === "string" && rawSuperType ? rawSuperType : null;
+        // Some AEM projects store sling:resourceSuperType inside jcr:content instead of root
+        const jcrContent = jcr["jcr:content"];
+        const rawSuperTypeFallback =
+          jcrContent && typeof jcrContent === "object" && !Array.isArray(jcrContent)
+            ? (jcrContent as Record<string, unknown>)["sling:resourceSuperType"]
+            : undefined;
+        const superType =
+          (typeof rawSuperType === "string" && rawSuperType ? rawSuperType : null) ??
+          (typeof rawSuperTypeFallback === "string" && rawSuperTypeFallback ? rawSuperTypeFallback : null);
 
         // Resolve superType chain (max 5, circular-safe)
         const superTypeChain = superType
@@ -648,7 +680,7 @@ export function registerCrxTools(
       inputSchema: {
         appName: z
           .string()
-          .describe('Application name under /apps/ (e.g. "caixa-international")'),
+          .describe('Application name under /apps/ (e.g. "myapp")'),  
         group: z
           .string()
           .optional()

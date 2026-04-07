@@ -160,7 +160,7 @@ export function registerExperienceFragmentTools(
     {
       description: "Create missing language-level Experience Fragment folders such as /<lang>/site and /<lang>/modals.",
       inputSchema: {
-        xfBasePath: z.string().describe("Base XF portal path, e.g. /content/experience-fragments/caixabank-italia"),
+        xfBasePath: z.string().describe("Base XF path, e.g. /content/experience-fragments/myapp"),
         languageCode: z.string().describe("Language code to create, e.g. it"),
         xfTypes: z.array(XF_TYPE_SCHEMA).default(["site", "modals"]).describe("Folder groups to create under the language root"),
       },

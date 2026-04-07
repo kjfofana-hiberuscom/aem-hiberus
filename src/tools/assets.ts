@@ -88,16 +88,16 @@ export function registerAssetTools(
           params["mimetype.value"] = mimeTypeFilter;
         }
         const data = await client.get("/bin/querybuilder.json", params);
-        const hits: any[] = data.hits ?? [];
-        const assets = hits.map((h: any) => ({
+        const hits = (data.hits ?? []) as Record<string, unknown>[];
+        const assets = hits.map((h) => ({
           path: h["jcr:path"],
-          name: (h["jcr:path"] as string).split("/").pop(),
+          name: String(h["jcr:path"] ?? "").split("/").pop(),
           mimeType: h["jcr:content/metadata/dam:mimeType"] ?? null,
           title: h["jcr:content/metadata/dc:title"] ?? null,
         }));
         return ok({ total: data.total ?? assets.length, limit, offset, assets });
-      } catch (e: any) {
-        return err(`listAssets failed: ${e.message}`);
+      } catch (e: unknown) {
+        return err(`listAssets failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   );
@@ -127,8 +127,8 @@ export function registerAssetTools(
           "p.properties": "jcr:path",
           orderby: "jcr:path",
         });
-        const hits: any[] = data.hits ?? [];
-        const folders: string[] = hits.map((h: any) => h["jcr:path"]);
+        const hits = (data.hits ?? []) as Record<string, unknown>[];
+        const folders: string[] = hits.map((h) => String(h["jcr:path"] ?? ""));
 
         // Build indented tree from sorted paths
         const rootDepth = folderPath.split("/").filter(Boolean).length;
@@ -145,8 +145,8 @@ export function registerAssetTools(
           tree: lines.join("\n"),
           folders,
         });
-      } catch (e: any) {
-        return err(`getAssetFolderTree failed: ${e.message}`);
+      } catch (e: unknown) {
+        return err(`getAssetFolderTree failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   );
@@ -166,7 +166,7 @@ export function registerAssetTools(
         damFolderPath: z
           .string()
           .describe(
-            "Target DAM folder path, e.g. /content/dam/caixa/portales/internacionales/_global/branding/countries-flags"
+            "Target DAM folder path, e.g. /content/dam/myapp/images"
           ),
         fileName: z
           .string()
@@ -210,8 +210,8 @@ export function registerAssetTools(
           status,
           apiResponse: result,
         });
-      } catch (e: any) {
-        return err(`uploadAsset failed: ${e.message}`);
+      } catch (e: unknown) {
+        return err(`uploadAsset failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   );
@@ -227,20 +227,24 @@ export function registerAssetTools(
       inputSchema: {
         assetPath: z
           .string()
-          .describe("Full DAM asset path, e.g. /content/dam/caixa/.../image.png"),
+          .describe("Full DAM asset path, e.g. /content/dam/myapp/images/hero.png"),
       },
     },
     async ({ assetPath }) => {
       try {
         const data = await client.get(`${assetPath}.json`);
-        const metadata = (data["jcr:content"] as any)?.metadata ?? {};
+        const jcrContent = data["jcr:content"];
+        const metadata =
+          jcrContent && typeof jcrContent === "object" && !Array.isArray(jcrContent)
+            ? ((jcrContent as Record<string, unknown>)["metadata"] ?? {})
+            : {};
         return ok({
           assetPath,
           name: assetPath.split("/").pop(),
           metadata,
         });
-      } catch (e: any) {
-        return err(`getAssetMetadata failed: ${e.message}`);
+      } catch (e: unknown) {
+        return err(`getAssetMetadata failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   );
@@ -255,7 +259,7 @@ export function registerAssetTools(
       inputSchema: {
         assetPath: z
           .string()
-          .describe("Full DAM asset path to delete, e.g. /content/dam/caixa/.../image.png"),
+          .describe("Full DAM asset path to delete, e.g. /content/dam/myapp/images/hero.png"),
       },
     },
     async ({ assetPath }) => {
@@ -269,8 +273,8 @@ export function registerAssetTools(
           deleted: true,
           timestamp: new Date().toISOString(),
         });
-      } catch (e: any) {
-        return err(`deleteAsset failed: ${e.message}`);
+      } catch (e: unknown) {
+        return err(`deleteAsset failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   );
