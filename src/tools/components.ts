@@ -185,6 +185,12 @@ interface PolicyResult {
   defaultClasses: string[];
   policyPath: string | null;
   rawPolicy: Record<string, unknown> | null;
+  /** "resolved"        — policy node found and has style configuration.
+   *  "confirmed-none"  — policy node found but contains no style configuration.
+   *  "unresolvable"    — no policy node could be located; mechanism:none is NOT confirmed. */
+  resolutionStatus: "resolved" | "confirmed-none" | "unresolvable";
+  /** Present only when resolutionStatus === "unresolvable". */
+  warning?: string;
 }
 
 /** Return the path up to and including the jcr:content segment. */
@@ -304,6 +310,53 @@ async function fetchPolicyAtPath(
   } catch {
     return null;
   }
+}
+
+/**
+ * Step 2d: resolve a policy via the page's cq:template policies mapping.
+ *
+ * AEM template-based publishing stores policy assignments at:
+ *   /conf/{site}/settings/wcm/templates/{tpl}/policies/jcr:content/{componentRelPath}
+ * Each cell node there has a cq:policy pointer to the actual policy node under
+ *   /conf/{site}/settings/wcm/policies/...
+ *
+ * Strategy: walk from the deepest relative segment up to jcr:content itself,
+ * trying each ancestor cell's cq:policy pointer (handles both per-component
+ * and per-container granularity).
+ */
+async function resolvePolicyViaTemplate(
+  client: AemClient,
+  componentPath: string
+): Promise<{ policyPath: string; rawPolicy: Record<string, unknown> } | null> {
+  const jcrContentPath = findJcrContentPath(componentPath);
+  if (!jcrContentPath) return null;
+
+  const jcrContent = await client.get(`${jcrContentPath}.json`).catch(() => null);
+  if (!jcrContent) return null;
+
+  const templatePath = jcrContent["cq:template"] as string | undefined;
+  if (!templatePath) return null;
+
+  const jcrIdx = componentPath.indexOf("/jcr:content/");
+  if (jcrIdx === -1) return null;
+  const relPath = componentPath.slice(jcrIdx + "/jcr:content/".length);
+  const segments = relPath.split("/").filter(Boolean);
+
+  // Try progressively shorter paths (component → container → root)
+  for (let len = segments.length; len >= 1; len--) {
+    const tryRelPath = segments.slice(0, len).join("/");
+    const policyCellPath = `${templatePath}/policies/jcr:content/${tryRelPath}`;
+    const policyCell = await client.get(`${policyCellPath}.json`).catch(() => null);
+    if (!policyCell) continue;
+
+    const cqPolicy = policyCell["cq:policy"] as string | undefined;
+    if (!cqPolicy) continue;
+
+    const rawPolicy = await fetchPolicyAtPath(client, cqPolicy);
+    if (rawPolicy) return { policyPath: cqPolicy, rawPolicy };
+  }
+
+  return null;
 }
 
 export function registerComponentTools(
@@ -738,24 +791,39 @@ export function registerComponentTools(
     "getComponentPolicy",
     {
       description:
-        "Get the AEM policy (Style System groups, CSS classes) applied to a component. " +
-        "Resolves the policy via cq:policy on the component node, cq:designPath heuristic, " +
-        "or /conf-based path. Returns mechanism (styleSystem | cssClass | none), styleGroups, " +
-        "defaultClasses, resolved policyPath and the rawPolicy node.",
+        "Get the AEM policy (Style System groups, CSS classes) applied to a component instance. " +
+        "Accepts the JCR path to a component node under /content/... and resolves its policy via: " +
+        "(1) inline cq:policy, (2) cq:designPath, (3) /conf heuristic, (4) template policies mapping. " +
+        "Returns mechanism (styleSystem | cssClass | none), styleGroups, defaultClasses, policyPath, " +
+        "rawPolicy, and resolutionStatus (resolved | confirmed-none | unresolvable). " +
+        "When resolutionStatus is 'unresolvable', mechanism:none does NOT mean the component has no policy — " +
+        "it means the policy could not be located automatically; a warning field explains why.",
       inputSchema: {
         componentPath: z
           .string()
-          .describe("Full JCR path to the component node"),
+          .describe(
+            "Full JCR path to the component node under /content/... (e.g. /content/my-site/page/jcr:content/root/container/title_0). " +
+            "Do NOT pass a /conf path here — use the optional policyPath parameter for that."
+          ),
         policyPath: z
           .string()
           .optional()
           .describe(
-            "Explicit full JCR path to the policy node. When omitted the policy is resolved heuristically."
+            "Explicit full JCR path to the policy node. When provided, skips all heuristics and uses this path directly."
           ),
       },
     },
     async ({ componentPath, policyPath: explicitPolicyPath }) => {
       try {
+        // Guard: /conf paths are policy/template nodes, not component instances
+        if (componentPath.startsWith("/conf/") && !componentPath.includes("/jcr:content/")) {
+          return err(
+            `getComponentPolicy: "${componentPath}" looks like a /conf policy or template path, not a component instance.\n` +
+            `Pass the component's JCR instance path (under /content/...) as componentPath.\n` +
+            `If you already have the policy node path, use the optional policyPath parameter instead.`
+          );
+        }
+
         // Step 1: read component — capture resourceType and inline cq:policy
         let resourceType = "";
         let inlinePolicyRef: string | undefined;
@@ -817,13 +885,39 @@ export function registerComponentTools(
           }
         }
 
-        // Step 3: parse policy data
+        // Step 2d: template-based resolution via cq:template → policies mapping
+        if (!rawPolicy) {
+          const templateResult = await resolvePolicyViaTemplate(client, componentPath);
+          if (templateResult) {
+            rawPolicy = templateResult.rawPolicy;
+            resolvedPolicyPath = templateResult.policyPath;
+          }
+        }
+
+        // Step 3: parse policy data and determine resolution status
         const parsed = parsePolicyData(rawPolicy);
+
+        const resolutionStatus: PolicyResult["resolutionStatus"] =
+          rawPolicy === null
+            ? "unresolvable"
+            : parsed.mechanism === "none"
+              ? "confirmed-none"
+              : "resolved";
 
         const result: PolicyResult = {
           ...parsed,
           policyPath: resolvedPolicyPath,
           rawPolicy,
+          resolutionStatus,
+          ...(resolutionStatus === "unresolvable"
+            ? {
+                warning:
+                  "No policy node found after exhausting all resolution strategies " +
+                  "(inline cq:policy, cq:designPath, /conf heuristic, template policies mapping). " +
+                  "The component may have a policy not discoverable from the instance path alone. " +
+                  "Try passing the explicit policyPath parameter if you know the policy node location.",
+              }
+            : {}),
         };
         return ok(result);
       } catch (e: any) {
@@ -839,19 +933,21 @@ export function registerComponentTools(
     "moveComponent",
     {
       description:
-        "Move an AEM component node to a new JCR path. Optionally re-order it before a sibling node at the destination.",
+        "Move an AEM component node to a new JCR path and/or re-order it before a sibling. Pass the same path as sourcePath and destinationPath to perform a reorder-only operation without moving.",
       inputSchema: {
         sourcePath: z
           .string()
           .describe("Full JCR path to the component node to move"),
         destinationPath: z
           .string()
-          .describe("Full JCR destination path (including the new node name)"),
+          .describe(
+            "Full JCR destination path (including the new node name). Can be the same as sourcePath to reorder without moving."
+          ),
         orderBefore: z
           .string()
           .optional()
           .describe(
-            "Full JCR path of the sibling node before which the moved component should be placed. Omit to keep natural order."
+            "Full JCR path of the sibling node before which the component should be placed. Omit to keep natural order."
           ),
       },
     },
@@ -864,11 +960,13 @@ export function registerComponentTools(
           return err(`moveComponent: source node not found at ${sourcePath}`);
         }
 
-        // Step 2: move via Sling POST :operation=move
-        const moveFd = new URLSearchParams();
-        moveFd.append(":operation", "move");
-        moveFd.append(":dest", destinationPath);
-        await client.post(sourcePath, moveFd);
+        // Step 2: move via Sling POST :operation=move (skip if same path — reorder-only)
+        if (sourcePath !== destinationPath) {
+          const moveFd = new URLSearchParams();
+          moveFd.append(":operation", "move");
+          moveFd.append(":dest", destinationPath);
+          await client.post(sourcePath, moveFd);
+        }
 
         // Step 3: optional ordering — Sling POST :order=before {siblingName}
         if (orderBefore) {
